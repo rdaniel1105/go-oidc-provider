@@ -3,6 +3,7 @@ module github.com/rdaniel1105/go-oidc-provider
 go 1.26.3
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/joho/godotenv v1.5.1
 	github.com/stretchr/testify v1.11.1
 )
