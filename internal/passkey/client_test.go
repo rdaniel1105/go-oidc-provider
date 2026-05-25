@@ -154,7 +154,7 @@ func TestClient_CompleteLogin_ReturnsUserID(t *testing.T) {
 	c.Equal("Alice", resp.DisplayName)
 }
 
-func TestClient_ServiceError_DecodesErrorCode(t *testing.T) {
+func TestClient_ErrService_DecodesErrorCode(t *testing.T) {
 	c := require.New(t)
 	fake := newFakePasskeyService(t)
 
@@ -166,7 +166,7 @@ func TestClient_ServiceError_DecodesErrorCode(t *testing.T) {
 		DisplayName: "Alice",
 	})
 
-	var serr *ServiceError
+	var serr *ErrService
 	c.ErrorAs(err, &serr)
 	c.Equal(http.StatusConflict, serr.Status)
 	c.Equal("username_taken", serr.Code)
@@ -208,16 +208,16 @@ func TestClient_TrimsTrailingSlash(t *testing.T) {
 	c.Len(fake.calls, 1, "trailing slash on baseURL must not produce double-slash 404")
 }
 
-func TestServiceError_ErrorString(t *testing.T) {
+func TestErrService_ErrorString(t *testing.T) {
 	c := require.New(t)
 
-	e := &ServiceError{Status: http.StatusBadRequest, Code: "invalid_request"}
+	e := &ErrService{Status: http.StatusBadRequest, Code: "invalid_request"}
 	c.Contains(e.Error(), "400")
 	c.Contains(e.Error(), "invalid_request")
 
-	bare := &ServiceError{Status: http.StatusNotFound}
+	bare := &ErrService{Status: http.StatusNotFound}
 	c.Contains(bare.Error(), "404")
 	c.NotContains(bare.Error(), "invalid_request", "bare error must not carry an extra code")
-	// errors.Is between different ServiceError instances should be false.
+	// errors.Is between different ErrService instances should be false.
 	c.False(errors.Is(e, bare))
 }

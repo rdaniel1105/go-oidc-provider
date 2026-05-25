@@ -54,12 +54,12 @@ type passkeyLoginClient interface {
 // AuthorizeHandler implements GET /oidc/authorize plus the two POST
 // endpoints the rendered login page calls to drive the passkey ceremony.
 type AuthorizeHandler struct {
-	clients      clientLookup
-	users        opUserLookup
-	sessions     authSessionStore
-	authCodes    authCodeIssuer
-	passkey      passkeyLoginClient
-	logger       *slog.Logger
+	clients   clientLookup
+	users     opUserLookup
+	sessions  authSessionStore
+	authCodes authCodeIssuer
+	passkey   passkeyLoginClient
+	logger    *slog.Logger
 }
 
 // NewAuthorizeHandler returns an AuthorizeHandler bound to its dependencies.
@@ -113,6 +113,7 @@ func (h *AuthorizeHandler) Authorize(w http.ResponseWriter, r *http.Request) {
 			"client_id is not registered")
 		return
 	}
+
 	if err != nil {
 		h.logger.Error("authorize: client lookup", "err", err)
 		renderAuthorizeErrorPage(w, h.logger, http.StatusInternalServerError,
@@ -121,15 +122,17 @@ func (h *AuthorizeHandler) Authorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if vErr := oidc.ValidateAuthorizeRequest(req, client); vErr != nil {
-		ae := oidc.AsAuthorizeError(vErr)
-		if ae != nil && ae.SafeRedirect {
+		ae, ok := errors.AsType[*oidc.ErrAuthorize](vErr)
+		if ok && ae.SafeRedirect {
 			http.Redirect(w, r, buildErrorRedirect(req.RedirectURI, ae, req.State), http.StatusFound)
 			return
 		}
+
 		desc := "invalid request"
-		if ae != nil {
+		if ok {
 			desc = ae.Description
 		}
+
 		renderAuthorizeErrorPage(w, h.logger, http.StatusBadRequest, desc)
 		return
 	}
@@ -280,9 +283,7 @@ func (h *AuthorizeHandler) LoginComplete(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *AuthorizeHandler) mapPasskeyError(w http.ResponseWriter, op string, err error) {
-	var serr *passkey.ServiceError
-	switch {
-	case errors.As(err, &serr):
+	if serr, ok := errors.AsType[*passkey.ErrService](err); ok {
 		switch serr.Code {
 		case "session_invalid":
 			writeError(w, h.logger, http.StatusUnauthorized, "session_invalid", "passkey session expired")
@@ -296,6 +297,10 @@ func (h *AuthorizeHandler) mapPasskeyError(w http.ResponseWriter, op string, err
 			writeError(w, h.logger, http.StatusBadGateway, "service_unavailable",
 				"passkey service returned an error")
 		}
+		return
+	}
+
+	switch {
 	case errors.Is(err, passkey.ErrServiceUnavailable),
 		errors.Is(err, passkey.ErrTransport):
 		h.logger.Error("passkey "+op, "err", err)
@@ -343,7 +348,7 @@ func buildCodeRedirect(redirectURI, code, state string) string {
 
 // buildErrorRedirect builds the RP redirect URL for a safe-redirect error:
 // redirect_uri + ?error=...&error_description=...&state=...
-func buildErrorRedirect(redirectURI string, ae *oidc.AuthorizeError, state string) string {
+func buildErrorRedirect(redirectURI string, ae *oidc.ErrAuthorize, state string) string {
 	u, err := url.Parse(redirectURI)
 	if err != nil {
 		return ""

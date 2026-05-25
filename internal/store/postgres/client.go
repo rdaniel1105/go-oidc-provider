@@ -59,8 +59,7 @@ func (s *ClientStore) Create(ctx context.Context, c *domain.Client) (*domain.Cli
 		return got, nil
 	}
 
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == pgerrcode.UniqueViolation {
 		return nil, domain.ErrClientIDTaken
 	}
 

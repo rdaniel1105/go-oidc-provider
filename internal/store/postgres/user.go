@@ -46,8 +46,7 @@ func (s *OPUserStore) Create(ctx context.Context, u *domain.OPUser) (*domain.OPU
 		return got, nil
 	}
 
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == pgerrcode.UniqueViolation {
 		switch pgErr.ConstraintName {
 		case "op_users_email_unique_live":
 			return nil, domain.ErrEmailTaken

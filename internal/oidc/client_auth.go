@@ -26,8 +26,8 @@ const (
 	ClientAuthErrInvalidRequest ClientAuthErrorCode = "invalid_request"
 )
 
-// ClientAuthError is the typed error returned from AuthenticateClient.
-type ClientAuthError struct {
+// ErrClientAuth is the typed error returned from AuthenticateClient.
+type ErrClientAuth struct {
 	// Code is the OAuth error identifier.
 	Code ClientAuthErrorCode
 	// Description is a human-readable detail (no untrusted input).
@@ -40,7 +40,7 @@ type ClientAuthError struct {
 }
 
 // Error implements the error interface.
-func (e *ClientAuthError) Error() string {
+func (e *ErrClientAuth) Error() string {
 	if e.Description == "" {
 		return "client auth: " + string(e.Code)
 	}
@@ -64,7 +64,7 @@ type ClientLookup interface {
 // Callers must have already called r.ParseForm before passing the
 // request in — the form values are looked up directly.
 //
-// Returns a typed *ClientAuthError on failure; the token handler maps
+// Returns a typed *ErrClientAuth on failure; the token handler maps
 // these to 400/401 with the appropriate WWW-Authenticate header.
 func AuthenticateClient(ctx context.Context, r *http.Request, clients ClientLookup) (*domain.Client, error) {
 	clientID, secret, method, err := extractCredentials(r)
@@ -74,14 +74,14 @@ func AuthenticateClient(ctx context.Context, r *http.Request, clients ClientLook
 
 	client, err := clients.GetByClientID(ctx, clientID)
 	if errors.Is(err, domain.ErrClientNotFound) {
-		return nil, &ClientAuthError{Code: ClientAuthErrInvalidClient, Description: "unknown client"}
+		return nil, &ErrClientAuth{Code: ClientAuthErrInvalidClient, Description: "unknown client"}
 	}
 	if err != nil {
 		return nil, err
 	}
 
 	if client.TokenEndpointAuthMethod != method {
-		return nil, &ClientAuthError{
+		return nil, &ErrClientAuth{
 			Code:        ClientAuthErrInvalidClient,
 			Description: "client is configured for " + string(client.TokenEndpointAuthMethod),
 		}
@@ -93,14 +93,14 @@ func AuthenticateClient(ctx context.Context, r *http.Request, clients ClientLook
 	}
 
 	if client.ClientSecretHash == nil || *client.ClientSecretHash == "" {
-		return nil, &ClientAuthError{
+		return nil, &ErrClientAuth{
 			Code:        ClientAuthErrInvalidClient,
 			Description: "client has no secret on file but was authenticated as confidential",
 		}
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(*client.ClientSecretHash), []byte(secret)); err != nil {
-		return nil, &ClientAuthError{Code: ClientAuthErrInvalidClient, Description: "client secret mismatch"}
+		return nil, &ErrClientAuth{Code: ClientAuthErrInvalidClient, Description: "client secret mismatch"}
 	}
 
 	return client, nil
@@ -111,14 +111,14 @@ func AuthenticateClient(ctx context.Context, r *http.Request, clients ClientLook
 func extractCredentials(r *http.Request) (clientID, secret string, method domain.TokenEndpointAuthMethod, err error) {
 	if header := r.Header.Get("Authorization"); header != "" {
 		if !strings.HasPrefix(header, "Basic ") {
-			return "", "", "", &ClientAuthError{
+			return "", "", "", &ErrClientAuth{
 				Code:        ClientAuthErrInvalidRequest,
 				Description: "only Basic authentication is supported at the token endpoint",
 			}
 		}
 		decoded, decodeErr := base64.StdEncoding.DecodeString(strings.TrimPrefix(header, "Basic "))
 		if decodeErr != nil {
-			return "", "", "", &ClientAuthError{
+			return "", "", "", &ErrClientAuth{
 				Code:            ClientAuthErrInvalidClient,
 				Description:     "Authorization header is not valid base64",
 				WWWAuthenticate: `Basic realm="oidc"`,
@@ -126,7 +126,7 @@ func extractCredentials(r *http.Request) (clientID, secret string, method domain
 		}
 		parts := strings.SplitN(string(decoded), ":", 2)
 		if len(parts) != 2 {
-			return "", "", "", &ClientAuthError{
+			return "", "", "", &ErrClientAuth{
 				Code:            ClientAuthErrInvalidClient,
 				Description:     "Authorization header is not client_id:client_secret",
 				WWWAuthenticate: `Basic realm="oidc"`,
@@ -137,7 +137,7 @@ func extractCredentials(r *http.Request) (clientID, secret string, method domain
 
 	clientID = r.PostForm.Get("client_id")
 	if clientID == "" {
-		return "", "", "", &ClientAuthError{
+		return "", "", "", &ErrClientAuth{
 			Code:        ClientAuthErrInvalidClient,
 			Description: "client_id is required",
 		}
@@ -149,14 +149,4 @@ func extractCredentials(r *http.Request) (clientID, secret string, method domain
 	}
 
 	return clientID, secret, domain.AuthMethodClientSecretPost, nil
-}
-
-// AsClientAuthError unwraps to *ClientAuthError. Returns nil if err is
-// not of that type.
-func AsClientAuthError(err error) *ClientAuthError {
-	var cae *ClientAuthError
-	if errors.As(err, &cae) {
-		return cae
-	}
-	return nil
 }

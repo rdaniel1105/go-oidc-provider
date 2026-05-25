@@ -441,8 +441,8 @@ func narrowRefreshScope(granted []string, requested string) ([]string, error) {
 }
 
 func (h *TokenHandler) writeClientAuthError(w http.ResponseWriter, err error) {
-	cae := oidc.AsClientAuthError(err)
-	if cae == nil {
+	cae, ok := errors.AsType[*oidc.ErrClientAuth](err)
+	if !ok {
 		h.logger.Error("token: client auth", "err", err)
 		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
 		return

@@ -1,6 +1,7 @@
 package oidc
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -44,9 +45,8 @@ func TestValidateAuthorizeRequest_UnregisteredRedirectURI(t *testing.T) {
 	req := sampleRequest()
 	req.RedirectURI = "https://evil.example.com/callback"
 
-	err := ValidateAuthorizeRequest(req, sampleClient())
-	ae := AsAuthorizeError(err)
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(req, sampleClient()))
+	c.True(ok)
 	c.Equal(AuthorizeErrInvalidRequest, ae.Code)
 	c.False(ae.SafeRedirect, "must not redirect to an unregistered URI")
 }
@@ -56,8 +56,8 @@ func TestValidateAuthorizeRequest_GrantNotAllowed(t *testing.T) {
 	client := sampleClient()
 	client.GrantTypes = []string{"refresh_token"}
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(sampleRequest(), client))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(sampleRequest(), client))
+	c.True(ok)
 	c.Equal(AuthorizeErrUnauthorizedClient, ae.Code)
 	c.True(ae.SafeRedirect)
 }
@@ -67,8 +67,8 @@ func TestValidateAuthorizeRequest_UnsupportedResponseType(t *testing.T) {
 	req := sampleRequest()
 	req.ResponseType = "token"
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(req, sampleClient()))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(req, sampleClient()))
+	c.True(ok)
 	c.Equal(AuthorizeErrUnsupportedResponseType, ae.Code)
 	c.True(ae.SafeRedirect)
 }
@@ -78,8 +78,8 @@ func TestValidateAuthorizeRequest_ClientResponseTypeRestricted(t *testing.T) {
 	client := sampleClient()
 	client.ResponseTypes = []string{"id_token"}
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(sampleRequest(), client))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(sampleRequest(), client))
+	c.True(ok)
 	c.Equal(AuthorizeErrUnauthorizedClient, ae.Code)
 	c.True(ae.SafeRedirect)
 }
@@ -89,8 +89,8 @@ func TestValidateAuthorizeRequest_MissingPKCE(t *testing.T) {
 	req := sampleRequest()
 	req.CodeChallenge = ""
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(req, sampleClient()))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(req, sampleClient()))
+	c.True(ok)
 	c.Equal(AuthorizeErrInvalidRequest, ae.Code)
 	c.True(ae.SafeRedirect)
 }
@@ -100,8 +100,8 @@ func TestValidateAuthorizeRequest_PKCEMethodMustBeS256(t *testing.T) {
 	req := sampleRequest()
 	req.CodeChallengeMethod = "plain"
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(req, sampleClient()))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(req, sampleClient()))
+	c.True(ok)
 	c.Equal(AuthorizeErrInvalidRequest, ae.Code)
 }
 
@@ -110,8 +110,8 @@ func TestValidateAuthorizeRequest_ScopeMissingOpenID(t *testing.T) {
 	req := sampleRequest()
 	req.Scope = []string{"profile"}
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(req, sampleClient()))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(req, sampleClient()))
+	c.True(ok)
 	c.Equal(AuthorizeErrInvalidScope, ae.Code)
 }
 
@@ -120,17 +120,17 @@ func TestValidateAuthorizeRequest_ScopeNotAllowedForClient(t *testing.T) {
 	req := sampleRequest()
 	req.Scope = []string{"openid", "payment"}
 
-	ae := AsAuthorizeError(ValidateAuthorizeRequest(req, sampleClient()))
-	c.NotNil(ae)
+	ae, ok := errors.AsType[*ErrAuthorize](ValidateAuthorizeRequest(req, sampleClient()))
+	c.True(ok)
 	c.Equal(AuthorizeErrInvalidScope, ae.Code)
 }
 
-func TestAuthorizeError_String(t *testing.T) {
+func TestErrAuthorize_String(t *testing.T) {
 	c := require.New(t)
-	e := &AuthorizeError{Code: AuthorizeErrInvalidScope, Description: "scope X not allowed"}
+	e := &ErrAuthorize{Code: AuthorizeErrInvalidScope, Description: "scope X not allowed"}
 	c.Contains(e.Error(), "invalid_scope")
 	c.Contains(e.Error(), "scope X not allowed")
 
-	bare := &AuthorizeError{Code: AuthorizeErrServerError}
+	bare := &ErrAuthorize{Code: AuthorizeErrServerError}
 	c.Contains(bare.Error(), "server_error")
 }

@@ -175,7 +175,7 @@ func TestUserHandler_Begin_MissingFields(t *testing.T) {
 func TestUserHandler_Begin_PasskeyServiceErrorMapsToConflict(t *testing.T) {
 	c := require.New(t)
 
-	p := &fakePasskey{beginErr: &passkey.ServiceError{Status: http.StatusConflict, Code: "username_taken"}}
+	p := &fakePasskey{beginErr: &passkey.ErrService{Status: http.StatusConflict, Code: "username_taken"}}
 	h := newUserHandler(t, p, newFakeSignupStore(), &fakeUserCreator{})
 
 	rr := postJSON(t, h.Begin, map[string]string{"email": "a@b.com", "display_name": "Alice"})
@@ -274,7 +274,7 @@ func TestUserHandler_Complete_UnknownSessionID(t *testing.T) {
 func TestUserHandler_Complete_PasskeyServiceRejects(t *testing.T) {
 	c := require.New(t)
 
-	p := &fakePasskey{completeErr: &passkey.ServiceError{Status: http.StatusBadRequest, Code: "attestation_rejected"}}
+	p := &fakePasskey{completeErr: &passkey.ErrService{Status: http.StatusBadRequest, Code: "attestation_rejected"}}
 	sigs := newFakeSignupStore()
 	sigs.saved["sess-1"] = domain.SignupState{Email: "a@b.com", DisplayName: "A"}
 	h := newUserHandler(t, p, sigs, &fakeUserCreator{})

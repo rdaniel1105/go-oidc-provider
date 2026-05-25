@@ -197,9 +197,7 @@ func (h *UserHandler) Complete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *UserHandler) mapPasskeyError(w http.ResponseWriter, op string, err error) {
-	var serr *passkey.ServiceError
-	switch {
-	case errors.As(err, &serr):
+	if serr, ok := errors.AsType[*passkey.ErrService](err); ok {
 		switch serr.Code {
 		case "username_taken":
 			writeError(w, h.logger, http.StatusConflict, "email_taken", "an account with this email already exists")
@@ -211,6 +209,10 @@ func (h *UserHandler) mapPasskeyError(w http.ResponseWriter, op string, err erro
 			h.logger.Warn("passkey "+op, "status", serr.Status, "code", serr.Code)
 			writeError(w, h.logger, http.StatusBadGateway, "service_unavailable", "passkey service returned an error")
 		}
+		return
+	}
+
+	switch {
 	case errors.Is(err, passkey.ErrServiceUnavailable):
 		h.logger.Error("passkey "+op, "err", err)
 		writeError(w, h.logger, http.StatusBadGateway, "service_unavailable", "passkey service is unavailable")

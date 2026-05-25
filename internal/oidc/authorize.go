@@ -1,7 +1,6 @@
 package oidc
 
 import (
-	"errors"
 	"fmt"
 	"slices"
 
@@ -60,12 +59,12 @@ const (
 	AuthorizeErrServerError AuthorizeErrorCode = "server_error"
 )
 
-// AuthorizeError is the typed error returned by ValidateAuthorizeRequest.
+// ErrAuthorize is the typed error returned by ValidateAuthorizeRequest.
 // The Code field maps to the OAuth error code; SafeRedirect indicates
 // whether the OP may safely send the user back to the requested
 // redirect_uri carrying ?error=... (only true once client_id and
 // redirect_uri have been verified).
-type AuthorizeError struct {
+type ErrAuthorize struct {
 	// Code is the OAuth error identifier.
 	Code AuthorizeErrorCode
 	// Description is the human-readable detail. Safe to render to the
@@ -79,7 +78,7 @@ type AuthorizeError struct {
 }
 
 // Error implements the error interface.
-func (e *AuthorizeError) Error() string {
+func (e *ErrAuthorize) Error() string {
 	if e.Description == "" {
 		return fmt.Sprintf("authorize: %s", e.Code)
 	}
@@ -87,7 +86,7 @@ func (e *AuthorizeError) Error() string {
 }
 
 // ValidateAuthorizeRequest checks req against the resolved client and
-// returns an AuthorizeError on the first failure. The check order is
+// returns an ErrAuthorize on the first failure. The check order is
 // deliberate: client + redirect_uri first (because everything after must
 // be reportable via redirect), then the parameter shape, then the scope.
 //
@@ -95,7 +94,7 @@ func (e *AuthorizeError) Error() string {
 // validated request and mint codes themselves.
 func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error {
 	if !slices.Contains(client.RedirectURIs, req.RedirectURI) {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrInvalidRequest,
 			Description:  "redirect_uri is not registered for this client",
 			SafeRedirect: false,
@@ -103,7 +102,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	}
 
 	if !slices.Contains(client.GrantTypes, "authorization_code") {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrUnauthorizedClient,
 			Description:  "client is not allowed to use the authorization_code grant",
 			SafeRedirect: true,
@@ -111,7 +110,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	}
 
 	if req.ResponseType != "code" {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrUnsupportedResponseType,
 			Description:  "only response_type=code is supported",
 			SafeRedirect: true,
@@ -119,7 +118,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	}
 
 	if len(client.ResponseTypes) > 0 && !slices.Contains(client.ResponseTypes, req.ResponseType) {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrUnauthorizedClient,
 			Description:  "client is not allowed to use this response_type",
 			SafeRedirect: true,
@@ -127,7 +126,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	}
 
 	if req.CodeChallenge == "" {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrInvalidRequest,
 			Description:  "code_challenge is required",
 			SafeRedirect: true,
@@ -135,7 +134,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	}
 
 	if req.CodeChallengeMethod != "S256" {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrInvalidRequest,
 			Description:  "code_challenge_method must be S256",
 			SafeRedirect: true,
@@ -143,7 +142,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	}
 
 	if len(req.Scope) == 0 || !slices.Contains(req.Scope, "openid") {
-		return &AuthorizeError{
+		return &ErrAuthorize{
 			Code:         AuthorizeErrInvalidScope,
 			Description:  "scope must include openid",
 			SafeRedirect: true,
@@ -152,7 +151,7 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 
 	for _, s := range req.Scope {
 		if !slices.Contains(client.Scopes, s) {
-			return &AuthorizeError{
+			return &ErrAuthorize{
 				Code:         AuthorizeErrInvalidScope,
 				Description:  fmt.Sprintf("scope %q is not allowed for this client", s),
 				SafeRedirect: true,
@@ -163,12 +162,3 @@ func ValidateAuthorizeRequest(req AuthorizeRequest, client *domain.Client) error
 	return nil
 }
 
-// AsAuthorizeError unwraps to *AuthorizeError. Returns nil if err is not
-// an authorize-shaped error.
-func AsAuthorizeError(err error) *AuthorizeError {
-	var ae *AuthorizeError
-	if errors.As(err, &ae) {
-		return ae
-	}
-	return nil
-}

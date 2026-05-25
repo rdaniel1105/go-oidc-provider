@@ -3,6 +3,7 @@ package oidc
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -82,8 +83,8 @@ func TestAuthenticateClient_Basic_WrongSecret(t *testing.T) {
 	}}
 
 	_, err := AuthenticateClient(context.Background(), makeReq(t, basic("demo-rp", "WRONG"), url.Values{}), clients)
-	cae := AsClientAuthError(err)
-	c.NotNil(cae)
+	cae, ok := errors.AsType[*ErrClientAuth](err)
+	c.True(ok)
 	c.Equal(ClientAuthErrInvalidClient, cae.Code)
 }
 
@@ -93,8 +94,8 @@ func TestAuthenticateClient_Basic_UnknownClient(t *testing.T) {
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 
 	_, err := AuthenticateClient(context.Background(), makeReq(t, basic("ghost", "x"), url.Values{}), clients)
-	cae := AsClientAuthError(err)
-	c.NotNil(cae)
+	cae, ok := errors.AsType[*ErrClientAuth](err)
+	c.True(ok)
 	c.Equal(ClientAuthErrInvalidClient, cae.Code)
 }
 
@@ -104,8 +105,8 @@ func TestAuthenticateClient_BasicHeader_Malformed(t *testing.T) {
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 
 	_, err := AuthenticateClient(context.Background(), makeReq(t, "Bearer foo", url.Values{}), clients)
-	cae := AsClientAuthError(err)
-	c.NotNil(cae)
+	cae, ok := errors.AsType[*ErrClientAuth](err)
+	c.True(ok)
 	c.Equal(ClientAuthErrInvalidRequest, cae.Code)
 }
 
@@ -115,8 +116,8 @@ func TestAuthenticateClient_BasicHeader_NotBase64(t *testing.T) {
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 
 	_, err := AuthenticateClient(context.Background(), makeReq(t, "Basic !!!not-base64!!!", url.Values{}), clients)
-	cae := AsClientAuthError(err)
-	c.NotNil(cae)
+	cae, ok := errors.AsType[*ErrClientAuth](err)
+	c.True(ok)
 	c.Equal(ClientAuthErrInvalidClient, cae.Code)
 	c.NotEmpty(cae.WWWAuthenticate)
 }
@@ -178,8 +179,8 @@ func TestAuthenticateClient_MethodMismatch(t *testing.T) {
 	form.Set("client_id", "basic-client")
 	form.Set("client_secret", "x")
 	_, err := AuthenticateClient(context.Background(), makeReq(t, "", form), clients)
-	cae := AsClientAuthError(err)
-	c.NotNil(cae)
+	cae, ok := errors.AsType[*ErrClientAuth](err)
+	c.True(ok)
 	c.Equal(ClientAuthErrInvalidClient, cae.Code)
 }
 
@@ -189,17 +190,17 @@ func TestAuthenticateClient_MissingClientID(t *testing.T) {
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 
 	_, err := AuthenticateClient(context.Background(), makeReq(t, "", url.Values{}), clients)
-	cae := AsClientAuthError(err)
-	c.NotNil(cae)
+	cae, ok := errors.AsType[*ErrClientAuth](err)
+	c.True(ok)
 	c.Equal(ClientAuthErrInvalidClient, cae.Code)
 }
 
-func TestClientAuthError_String(t *testing.T) {
+func TestErrClientAuth_String(t *testing.T) {
 	c := require.New(t)
-	e := &ClientAuthError{Code: ClientAuthErrInvalidClient, Description: "bad"}
+	e := &ErrClientAuth{Code: ClientAuthErrInvalidClient, Description: "bad"}
 	c.Contains(e.Error(), "invalid_client")
 	c.Contains(e.Error(), "bad")
 
-	bare := &ClientAuthError{Code: ClientAuthErrInvalidRequest}
+	bare := &ErrClientAuth{Code: ClientAuthErrInvalidRequest}
 	c.Contains(bare.Error(), "invalid_request")
 }

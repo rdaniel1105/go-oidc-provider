@@ -33,10 +33,10 @@ var (
 	ErrServiceUnavailable = errors.New("passkey: service unavailable")
 )
 
-// ServiceError is returned when the passkey service responds with a 4xx
+// ErrService is returned when the passkey service responds with a 4xx
 // status carrying a stable error code. The Code field is the value of
 // the "error" key in the JSON body; the Status field is the HTTP status.
-type ServiceError struct {
+type ErrService struct {
 	// Status is the HTTP status returned by the passkey service.
 	Status int
 	// Code is the stable error identifier in the response body
@@ -46,7 +46,7 @@ type ServiceError struct {
 }
 
 // Error implements the error interface.
-func (e *ServiceError) Error() string {
+func (e *ErrService) Error() string {
 	if e.Code == "" {
 		return fmt.Sprintf("passkey: service returned %d", e.Status)
 	}
@@ -150,7 +150,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 
 	if resp.StatusCode >= 400 {
-		return decodeServiceError(resp.StatusCode, respBody)
+		return decodeErrService(resp.StatusCode, respBody)
 	}
 
 	if out != nil && len(respBody) > 0 {
@@ -162,12 +162,12 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	return nil
 }
 
-func decodeServiceError(status int, body []byte) error {
+func decodeErrService(status int, body []byte) error {
 	var envelope struct {
 		Error string `json:"error"`
 	}
 
 	_ = json.Unmarshal(body, &envelope)
 
-	return &ServiceError{Status: status, Code: envelope.Error}
+	return &ErrService{Status: status, Code: envelope.Error}
 }

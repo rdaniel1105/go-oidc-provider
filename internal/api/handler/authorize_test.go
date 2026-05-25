@@ -404,7 +404,7 @@ func TestLoginComplete_PasskeyServiceRejects(t *testing.T) {
 	c := require.New(t)
 	h := newAuthHarness(t)
 	authSessionID := seedSession(t, h)
-	h.passkey.completeErr = &passkey.ServiceError{Status: http.StatusBadRequest, Code: "invalid_request"}
+	h.passkey.completeErr = &passkey.ErrService{Status: http.StatusBadRequest, Code: "invalid_request"}
 
 	rr := postLoginComplete(t, h, map[string]any{
 		"auth_session_id":    authSessionID,
