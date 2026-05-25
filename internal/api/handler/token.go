@@ -22,6 +22,14 @@ type authCodeConsumer interface {
 	Consume(ctx context.Context, code string) (*domain.AuthCode, error)
 }
 
+// cibaRequestRedeemer captures the read + delete pair used by the token
+// endpoint's CIBA-grant branch to consume an auth_req_id after a
+// successful approved redemption so the same id cannot mint two pairs.
+type cibaRequestRedeemer interface {
+	Get(ctx context.Context, authReqID string) (*domain.CIBARequest, error)
+	Delete(ctx context.Context, authReqID string) error
+}
+
 // refreshTokenStore captures the full lifecycle the token endpoint needs:
 // issuance at auth-code grant, lookup-by-hash + revocation at rotation,
 // and family-wide takedown when a stolen token is replayed.
@@ -44,19 +52,20 @@ type activeKeySource interface {
 	Active() (kid string, priv *ecdsa.PrivateKey, err error)
 }
 
-// TokenHandler implements POST /oidc/token. v1 covers only the
-// authorization_code grant; refresh_token rotation and the CIBA grant
-// land in later phases.
+// TokenHandler implements POST /oidc/token across the authorization_code,
+// refresh_token, and CIBA grants.
 type TokenHandler struct {
-	clients    oidc.ClientLookup
-	authCodes  authCodeConsumer
-	users      opUserByID
-	refresh    refreshTokenStore
-	keys       activeKeySource
-	issuer     string
-	accessTTL  time.Duration
-	refreshTTL time.Duration
-	logger     *slog.Logger
+	clients      oidc.ClientLookup
+	authCodes    authCodeConsumer
+	users        opUserByID
+	refresh      refreshTokenStore
+	ciba         cibaRequestRedeemer
+	keys         activeKeySource
+	issuer       string
+	accessTTL    time.Duration
+	refreshTTL   time.Duration
+	pollInterval int
+	logger       *slog.Logger
 }
 
 // TokenHandlerDeps bundles the collaborators TokenHandler needs.
@@ -70,6 +79,9 @@ type TokenHandlerDeps struct {
 	Users opUserByID
 	// Refresh persists newly issued refresh-token rows.
 	Refresh refreshTokenStore
+	// CIBA reads + deletes auth_req_id-keyed CIBARequests for the CIBA
+	// grant's polling exchange.
+	CIBA cibaRequestRedeemer
 	// Keys provides the active ES256 signing key + kid for token signing.
 	Keys activeKeySource
 	// Issuer is the OP issuer URL, copied verbatim into iss / aud claims.
@@ -78,6 +90,10 @@ type TokenHandlerDeps struct {
 	AccessTTL time.Duration
 	// RefreshTTL bounds the lifetime of issued refresh tokens.
 	RefreshTTL time.Duration
+	// PollInterval is the seconds value the OP advertised at /bc-authorize.
+	// Currently used only for slow-down decisions; v1 does not implement
+	// slow_down, but holding it here keeps the wiring honest.
+	PollInterval int
 	// Logger receives one structured line per failure path that warrants it.
 	Logger *slog.Logger
 }
@@ -85,15 +101,17 @@ type TokenHandlerDeps struct {
 // NewTokenHandler returns a TokenHandler from its dependencies.
 func NewTokenHandler(deps TokenHandlerDeps) *TokenHandler {
 	return &TokenHandler{
-		clients:    deps.Clients,
-		authCodes:  deps.AuthCodes,
-		users:      deps.Users,
-		refresh:    deps.Refresh,
-		keys:       deps.Keys,
-		issuer:     deps.Issuer,
-		accessTTL:  deps.AccessTTL,
-		refreshTTL: deps.RefreshTTL,
-		logger:     deps.Logger,
+		clients:      deps.Clients,
+		authCodes:    deps.AuthCodes,
+		users:        deps.Users,
+		refresh:      deps.Refresh,
+		ciba:         deps.CIBA,
+		keys:         deps.Keys,
+		issuer:       deps.Issuer,
+		accessTTL:    deps.AccessTTL,
+		refreshTTL:   deps.RefreshTTL,
+		pollInterval: deps.PollInterval,
+		logger:       deps.Logger,
 	}
 }
 
@@ -128,10 +146,176 @@ func (h *TokenHandler) Token(w http.ResponseWriter, r *http.Request) {
 		h.handleAuthorizationCode(w, r, client)
 	case "refresh_token":
 		h.handleRefreshToken(w, r, client)
+	case oidc.CIBAGrantType:
+		h.handleCIBA(w, r, client)
 	default:
 		writeError(w, h.logger, http.StatusBadRequest, "unsupported_grant_type",
 			"grant_type "+grant+" is not supported at this endpoint")
 	}
+}
+
+// handleCIBA implements the polling redemption of a CIBA auth_req_id at
+// the token endpoint. Branches on the underlying request's lifecycle:
+//
+//   - not found → expired_token (TTL ran out or already redeemed)
+//   - wrong client → invalid_grant
+//   - pending → authorization_pending (RP polls again after `interval`)
+//   - denied → access_denied
+//   - approved → mint tokens, delete the request (single-use redemption)
+//
+// slow_down is intentionally not implemented in v1; clients honoring the
+// advertised interval will not be told to slow down regardless of how
+// fast they actually poll, which is fine for a single-tenant demo OP.
+func (h *TokenHandler) handleCIBA(w http.ResponseWriter, r *http.Request, client *domain.Client) {
+	authReqID := strings.TrimSpace(r.PostForm.Get("auth_req_id"))
+	if authReqID == "" {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_request",
+			"auth_req_id is required")
+		return
+	}
+
+	cibaReq, err := h.ciba.Get(r.Context(), authReqID)
+	if errors.Is(err, domain.ErrCIBARequestNotFound) {
+		writeError(w, h.logger, http.StatusBadRequest, "expired_token",
+			"auth_req_id is unknown or expired")
+		return
+	}
+	if err != nil {
+		h.logger.Error("token: lookup ciba request", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	if cibaReq.ClientID != client.ClientID {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"auth_req_id was issued to a different client")
+		return
+	}
+
+	switch cibaReq.Status {
+	case domain.CIBAStatusPending:
+		writeError(w, h.logger, http.StatusBadRequest, "authorization_pending",
+			"the user has not yet approved or denied the request")
+		return
+	case domain.CIBAStatusDenied:
+		// Burn the request so a denied auth_req_id cannot be replayed
+		// for repeated access_denied polls — keeps Redis tidy.
+		if err := h.ciba.Delete(r.Context(), authReqID); err != nil {
+			h.logger.Error("token: delete denied ciba request", "err", err)
+		}
+		writeError(w, h.logger, http.StatusBadRequest, "access_denied",
+			"the user declined the request")
+		return
+	case domain.CIBAStatusApproved:
+		// Fall through to token minting.
+	default:
+		h.logger.Error("token: unknown ciba status", "status", cibaReq.Status)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	user, err := h.users.GetByID(r.Context(), cibaReq.OPUserID)
+	if errors.Is(err, domain.ErrOPUserNotFound) {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"the user backing this request no longer exists")
+		return
+	}
+	if err != nil {
+		h.logger.Error("token: lookup op_user for ciba", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	kid, priv, err := h.keys.Active()
+	if err != nil {
+		h.logger.Error("token: active key", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	now := nowUTC()
+	accessExpiry := now.Add(h.accessTTL)
+
+	// auth_time on a CIBA-issued ID token is the moment the user pressed
+	// Authorize — captured on the request when the approval ceremony
+	// completed. Fall back to IssuedAt for the corner case where the
+	// store didn't stamp it (defensive — the transitioner always does).
+	authTime := cibaReq.IssuedAt
+	if cibaReq.ApprovedAt != nil {
+		authTime = *cibaReq.ApprovedAt
+	}
+
+	accessToken, err := oidc.MintAccessToken(oidc.AccessTokenInput{
+		Issuer:    h.issuer,
+		SubjectID: user.ID.String(),
+		ClientID:  client.ClientID,
+		IssuedAt:  now,
+		Expiry:    accessExpiry,
+		Scope:     cibaReq.Scope,
+	}, priv, kid)
+	if err != nil {
+		h.logger.Error("token: mint access token (ciba)", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	idToken, err := oidc.MintIDToken(oidc.IDTokenInput{
+		Issuer:    h.issuer,
+		SubjectID: user.ID.String(),
+		Audience:  client.ClientID,
+		IssuedAt:  now,
+		Expiry:    accessExpiry,
+		AuthTime:  authTime,
+		ACR:       "urn:passkey",
+		AMR:       []string{"webauthn", "user"},
+		Scope:     cibaReq.Scope,
+		Email:     user.Email,
+		Name:      user.DisplayName,
+	}, priv, kid)
+	if err != nil {
+		h.logger.Error("token: mint id token (ciba)", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	refreshRaw, refreshHash, err := oidc.NewRefreshToken()
+	if err != nil {
+		h.logger.Error("token: new refresh token (ciba)", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	if _, err := h.refresh.Create(r.Context(), &domain.RefreshToken{
+		TokenHash: refreshHash,
+		ClientID:  client.ClientID,
+		OPUserID:  user.ID,
+		FamilyID:  uuid.New(),
+		Scope:     cibaReq.Scope,
+		AuthTime:  authTime,
+		ExpiresAt: now.Add(h.refreshTTL),
+	}); err != nil {
+		h.logger.Error("token: persist refresh token (ciba)", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	// Successful single-use redemption — delete the CIBARequest so a
+	// follow-up poll gets expired_token rather than another token pair.
+	// Tokens are already in the response on the wire; a Delete failure
+	// here is logged but does not undo the response (and the request
+	// will TTL-expire shortly regardless).
+	if err := h.ciba.Delete(r.Context(), authReqID); err != nil {
+		h.logger.Error("token: delete redeemed ciba request", "err", err, "auth_req_id", authReqID)
+	}
+
+	writeJSON(w, h.logger, http.StatusOK, tokenResponse{
+		AccessToken:  accessToken,
+		IDToken:      idToken,
+		RefreshToken: refreshRaw,
+		TokenType:    "Bearer",
+		ExpiresIn:    int(h.accessTTL.Seconds()),
+		Scope:        strings.Join(cibaReq.Scope, " "),
+	})
 }
 
 func (h *TokenHandler) handleAuthorizationCode(w http.ResponseWriter, r *http.Request, client *domain.Client) {

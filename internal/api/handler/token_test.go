@@ -146,6 +146,37 @@ func (f *fakeRefreshStore) RevokeFamily(_ context.Context, familyID uuid.UUID, a
 	return n, nil
 }
 
+type fakeCIBARedeemer struct {
+	mu      sync.Mutex
+	stored  map[string]*domain.CIBARequest
+	deleted []string
+}
+
+func newFakeCIBARedeemer() *fakeCIBARedeemer {
+	return &fakeCIBARedeemer{stored: map[string]*domain.CIBARequest{}}
+}
+
+func (f *fakeCIBARedeemer) Get(_ context.Context, authReqID string) (*domain.CIBARequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.stored[authReqID]
+	if !ok {
+		return nil, domain.ErrCIBARequestNotFound
+	}
+	cp := *r
+	return &cp, nil
+}
+
+func (f *fakeCIBARedeemer) Delete(_ context.Context, authReqID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.stored[authReqID]; ok {
+		delete(f.stored, authReqID)
+		f.deleted = append(f.deleted, authReqID)
+	}
+	return nil
+}
+
 type fakeKeySource struct {
 	kid  string
 	priv *ecdsa.PrivateKey
@@ -162,6 +193,7 @@ type tokenHarness struct {
 	authCodes *fakeAuthCodeConsumer
 	users     *fakeUsersByID
 	refresh   *fakeRefreshStore
+	ciba      *fakeCIBARedeemer
 	keys      *fakeKeySource
 	handler   *TokenHandler
 }
@@ -179,18 +211,21 @@ func newTokenHarness(t *testing.T) *tokenHarness {
 	authCodes := newFakeAuthCodeConsumer()
 	users := &fakeUsersByID{byID: map[uuid.UUID]*domain.OPUser{}}
 	refresh := newFakeRefreshStore()
+	ciba := newFakeCIBARedeemer()
 	keys := &fakeKeySource{kid: kid, priv: priv}
 
 	h := NewTokenHandler(TokenHandlerDeps{
-		Clients:    clients,
-		AuthCodes:  authCodes,
-		Users:      users,
-		Refresh:    refresh,
-		Keys:       keys,
-		Issuer:     "http://op.local:8081",
-		AccessTTL:  time.Hour,
-		RefreshTTL: 720 * time.Hour,
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Clients:      clients,
+		AuthCodes:    authCodes,
+		Users:        users,
+		Refresh:      refresh,
+		CIBA:         ciba,
+		Keys:         keys,
+		Issuer:       "http://op.local:8081",
+		AccessTTL:    time.Hour,
+		RefreshTTL:   720 * time.Hour,
+		PollInterval: 5,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	return &tokenHarness{
@@ -198,6 +233,7 @@ func newTokenHarness(t *testing.T) *tokenHarness {
 		authCodes: authCodes,
 		users:     users,
 		refresh:   refresh,
+		ciba:      ciba,
 		keys:      keys,
 		handler:   h,
 	}
@@ -701,4 +737,189 @@ func TestNarrowRefreshScope(t *testing.T) {
 
 	_, err = narrowRefreshScope([]string{"openid"}, "openid payment")
 	c.Error(err)
+}
+
+// --- CIBA grant ---
+
+func seedCIBARequest(t *testing.T, h *tokenHarness, status domain.CIBAStatus) (authReqID string, user *domain.OPUser) {
+	t.Helper()
+
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ID:                      uuid.New(),
+		ClientID:                "demo-rp",
+		ClientSecretHash:        bcryptHash(t, "super-secret"),
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		Scopes:                  []string{"openid", "profile", "email"},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+	}
+
+	user = &domain.OPUser{
+		ID:            uuid.New(),
+		Email:         "alice@example.com",
+		DisplayName:   "Alice",
+		PasskeyUserID: uuid.New(),
+	}
+	h.users.byID[user.ID] = user
+
+	authReqID = "auth-req-ciba"
+	now := time.Now().UTC()
+	req := &domain.CIBARequest{
+		ClientID:       "demo-rp",
+		OPUserID:       user.ID,
+		Scope:          []string{"openid", "profile"},
+		BindingMessage: "Authorize $50",
+		Status:         status,
+		IssuedAt:       now.Add(-30 * time.Second),
+	}
+	if status == domain.CIBAStatusApproved {
+		t := now
+		req.ApprovedAt = &t
+	} else if status == domain.CIBAStatusDenied {
+		t := now
+		req.DeniedAt = &t
+	}
+	h.ciba.stored[authReqID] = req
+
+	return authReqID, user
+}
+
+func cibaTokenForm(authReqID string) url.Values {
+	form := url.Values{}
+	form.Set("grant_type", oidc.CIBAGrantType)
+	form.Set("auth_req_id", authReqID)
+	return form
+}
+
+func TestToken_CIBA_Pending(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	authReqID, _ := seedCIBARequest(t, h, domain.CIBAStatusPending)
+
+	rr := postForm(t, h.handler, cibaTokenForm(authReqID), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("authorization_pending", decodeErrorCode(t, rr))
+
+	// Pending requests are NOT deleted on poll — the next call must
+	// still see them.
+	_, ok := h.ciba.stored[authReqID]
+	c.True(ok)
+}
+
+func TestToken_CIBA_Denied(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	authReqID, _ := seedCIBARequest(t, h, domain.CIBAStatusDenied)
+
+	rr := postForm(t, h.handler, cibaTokenForm(authReqID), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("access_denied", decodeErrorCode(t, rr))
+
+	// Denied requests are deleted so they cannot be polled forever.
+	c.Contains(h.ciba.deleted, authReqID)
+}
+
+func TestToken_CIBA_Approved_MintsTokens(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	authReqID, user := seedCIBARequest(t, h, domain.CIBAStatusApproved)
+
+	rr := postForm(t, h.handler, cibaTokenForm(authReqID), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusOK, rr.Code, "body=%s", rr.Body.String())
+
+	var resp tokenResponse
+	c.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+	c.Equal("Bearer", resp.TokenType)
+	c.Equal(3600, resp.ExpiresIn)
+	c.Equal("openid profile", resp.Scope)
+	c.NotEmpty(resp.AccessToken)
+	c.NotEmpty(resp.IDToken)
+	c.NotEmpty(resp.RefreshToken)
+
+	// ID token carries acr/amr + auth_time from the approval moment.
+	parsed, err := jwt.ParseSigned(resp.IDToken, []jose.SignatureAlgorithm{jose.ES256})
+	c.NoError(err)
+	var idClaims oidc.IDTokenClaims
+	c.NoError(parsed.Claims(&h.keys.priv.PublicKey, &idClaims))
+	c.Equal(user.ID.String(), idClaims.Subject)
+	c.Equal("demo-rp", idClaims.Audience)
+	c.Equal("urn:passkey", idClaims.ACR)
+	c.Equal([]string{"webauthn", "user"}, idClaims.AMR)
+	c.NotZero(idClaims.AuthTime)
+	c.Empty(idClaims.Nonce, "CIBA does not carry a nonce")
+
+	// Refresh token persisted.
+	c.Len(h.refresh.created, 1)
+	c.Equal(oidc.HashRefreshToken(resp.RefreshToken), h.refresh.created[0].TokenHash)
+
+	// Approved request is consumed: a second poll must see expired_token.
+	c.Contains(h.ciba.deleted, authReqID)
+	rr2 := postForm(t, h.handler, cibaTokenForm(authReqID), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr2.Code)
+	c.Equal("expired_token", decodeErrorCode(t, rr2))
+}
+
+func TestToken_CIBA_UnknownAuthReqID(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ClientID:                "demo-rp",
+		ClientSecretHash:        bcryptHash(t, "super-secret"),
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+	}
+
+	rr := postForm(t, h.handler, cibaTokenForm("ghost"), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("expired_token", decodeErrorCode(t, rr))
+}
+
+func TestToken_CIBA_MissingAuthReqID(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ClientID:                "demo-rp",
+		ClientSecretHash:        bcryptHash(t, "super-secret"),
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", oidc.CIBAGrantType)
+	rr := postForm(t, h.handler, form, basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_request", decodeErrorCode(t, rr))
+}
+
+func TestToken_CIBA_BoundToDifferentClient(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	authReqID, _ := seedCIBARequest(t, h, domain.CIBAStatusApproved)
+
+	// Second client authenticates correctly but doesn't own the request.
+	h.clients.byClientID["other-rp"] = &domain.Client{
+		ClientID:                "other-rp",
+		ClientSecretHash:        bcryptHash(t, "other-secret"),
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+	}
+
+	rr := postForm(t, h.handler, cibaTokenForm(authReqID), basic("other-rp", "other-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+
+	// Request must not be deleted when the wrong client tries — the
+	// rightful client must still be able to redeem it.
+	_, ok := h.ciba.stored[authReqID]
+	c.True(ok)
+}
+
+func TestToken_CIBA_UserDeleted(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	authReqID, user := seedCIBARequest(t, h, domain.CIBAStatusApproved)
+	delete(h.users.byID, user.ID)
+
+	rr := postForm(t, h.handler, cibaTokenForm(authReqID), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
 }

@@ -72,6 +72,18 @@ func (s *CIBARequestStore) Get(ctx context.Context, authReqID string) (*domain.C
 	return &out, nil
 }
 
+// Delete removes the CIBARequest with the given auth_req_id. Used by
+// the token endpoint after a successful approved-state redemption so
+// the same auth_req_id cannot mint a second token pair; subsequent
+// polls then fall into the not-found path and return expired_token.
+// Delete is idempotent: deleting a missing key is not an error.
+func (s *CIBARequestStore) Delete(ctx context.Context, authReqID string) error {
+	if err := s.client.Del(ctx, cibaRequestKeyPrefix+authReqID).Err(); err != nil {
+		return fmt.Errorf("delete ciba request: %w", err)
+	}
+	return nil
+}
+
 // Approve transitions a pending request to approved and stamps ApprovedAt.
 // Returns ErrCIBARequestNotFound if the auth_req_id is unknown or expired,
 // ErrCIBANotPending if the request is already in a terminal state.

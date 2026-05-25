@@ -125,6 +125,25 @@ func TestCIBARequestStore_Approve_NotFound(t *testing.T) {
 	c.ErrorIs(err, domain.ErrCIBARequestNotFound)
 }
 
+func TestCIBARequestStore_Delete(t *testing.T) {
+	c := require.New(t)
+	resetDB(t)
+
+	store := NewCIBARequestStore(testClient)
+	ctx := context.Background()
+
+	authReqID, err := store.Issue(ctx, sampleCIBARequest(), 10*time.Minute)
+	c.NoError(err)
+
+	c.NoError(store.Delete(ctx, authReqID))
+
+	_, err = store.Get(ctx, authReqID)
+	c.ErrorIs(err, domain.ErrCIBARequestNotFound)
+
+	// Deleting an already-deleted key is a no-op.
+	c.NoError(store.Delete(ctx, authReqID))
+}
+
 func TestCIBARequestStore_Issue_PreservesTTL(t *testing.T) {
 	c := require.New(t)
 	resetDB(t)

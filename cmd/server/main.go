@@ -87,15 +87,17 @@ func main() {
 		clientStore, opUserStore, authSessionStore, authCodeStore, passkeyClient, logger,
 	)
 	tokenHandler := handler.NewTokenHandler(handler.TokenHandlerDeps{
-		Clients:    clientStore,
-		AuthCodes:  authCodeStore,
-		Users:      opUserStore,
-		Refresh:    refreshTokenStore,
-		Keys:       keys,
-		Issuer:     cfg.Issuer,
-		AccessTTL:  cfg.AccessTokenTTL,
-		RefreshTTL: cfg.RefreshTokenTTL,
-		Logger:     logger,
+		Clients:      clientStore,
+		AuthCodes:    authCodeStore,
+		Users:        opUserStore,
+		Refresh:      refreshTokenStore,
+		CIBA:         cibaRequestStore,
+		Keys:         keys,
+		Issuer:       cfg.Issuer,
+		AccessTTL:    cfg.AccessTokenTTL,
+		RefreshTTL:   cfg.RefreshTokenTTL,
+		PollInterval: 5,
+		Logger:       logger,
 	})
 	userInfoHandler := handler.NewUserInfoHandler(keys, opUserStore, cfg.Issuer, logger)
 	cibaHandler := handler.NewCIBAHandler(handler.CIBAHandlerDeps{
