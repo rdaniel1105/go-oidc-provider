@@ -15,7 +15,7 @@ A Go OpenID Provider that ships the parts most reference impls hand-wave: a full
 | 5. Postgres stores | ✅ |
 | 6. Redis stores | ✅ |
 | 7. go-passkey-auth HTTP client | ✅ |
-| 8. User signup | ⏳ |
+| 8. User signup | ✅ |
 | 9. Auth code flow | ⏳ |
 | 10. Token endpoint | ⏳ |
 | 11. UserInfo | ⏳ |

@@ -57,4 +57,9 @@ var (
 	// finds no entry (expired, never issued, or already consumed).
 	// Approval tokens are single-use.
 	ErrApprovalTokenNotFound = errors.New("approval token not found")
+
+	// ErrSignupStateNotFound is returned when a /users/complete call
+	// references a session_id for which no signup payload remains
+	// (expired, never issued, or already consumed).
+	ErrSignupStateNotFound = errors.New("signup state not found")
 )
