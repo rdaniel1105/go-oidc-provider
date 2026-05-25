@@ -226,16 +226,6 @@ func (h *TokenHandler) handleCIBA(w http.ResponseWriter, r *http.Request, client
 		return
 	}
 
-	kid, priv, err := h.keys.Active()
-	if err != nil {
-		h.logger.Error("token: active key", "err", err)
-		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
-		return
-	}
-
-	now := nowUTC()
-	accessExpiry := now.Add(h.accessTTL)
-
 	// auth_time on a CIBA-issued ID token is the moment the user pressed
 	// Authorize — captured on the request when the approval ceremony
 	// completed. Fall back to IssuedAt for the corner case where the
@@ -245,55 +235,22 @@ func (h *TokenHandler) handleCIBA(w http.ResponseWriter, r *http.Request, client
 		authTime = *cibaReq.ApprovedAt
 	}
 
-	accessToken, err := oidc.MintAccessToken(oidc.AccessTokenInput{
-		Issuer:    h.issuer,
-		SubjectID: user.ID.String(),
-		ClientID:  client.ClientID,
-		IssuedAt:  now,
-		Expiry:    accessExpiry,
-		Scope:     cibaReq.Scope,
-	}, priv, kid)
+	tokens, err := mintCIBATokens(r.Context(), mintCIBATokensInput{
+		Client:     client,
+		User:       user,
+		Scope:      cibaReq.Scope,
+		AuthTime:   authTime,
+		Issuer:     h.issuer,
+		AccessTTL:  h.accessTTL,
+		RefreshTTL: h.refreshTTL,
+	}, h.keys)
 	if err != nil {
-		h.logger.Error("token: mint access token (ciba)", "err", err)
+		h.logger.Error("token: mint ciba token set", "err", err)
 		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
 		return
 	}
 
-	idToken, err := oidc.MintIDToken(oidc.IDTokenInput{
-		Issuer:    h.issuer,
-		SubjectID: user.ID.String(),
-		Audience:  client.ClientID,
-		IssuedAt:  now,
-		Expiry:    accessExpiry,
-		AuthTime:  authTime,
-		ACR:       "urn:passkey",
-		AMR:       []string{"webauthn", "user"},
-		Scope:     cibaReq.Scope,
-		Email:     user.Email,
-		Name:      user.DisplayName,
-	}, priv, kid)
-	if err != nil {
-		h.logger.Error("token: mint id token (ciba)", "err", err)
-		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
-		return
-	}
-
-	refreshRaw, refreshHash, err := oidc.NewRefreshToken()
-	if err != nil {
-		h.logger.Error("token: new refresh token (ciba)", "err", err)
-		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
-		return
-	}
-
-	if _, err := h.refresh.Create(r.Context(), &domain.RefreshToken{
-		TokenHash: refreshHash,
-		ClientID:  client.ClientID,
-		OPUserID:  user.ID,
-		FamilyID:  uuid.New(),
-		Scope:     cibaReq.Scope,
-		AuthTime:  authTime,
-		ExpiresAt: now.Add(h.refreshTTL),
-	}); err != nil {
+	if err := persistCIBARefreshRow(r.Context(), h.refresh, client, user, cibaReq.Scope, tokens.RefreshHash, authTime, tokens.RefreshExp); err != nil {
 		h.logger.Error("token: persist refresh token (ciba)", "err", err)
 		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
 		return
@@ -309,9 +266,9 @@ func (h *TokenHandler) handleCIBA(w http.ResponseWriter, r *http.Request, client
 	}
 
 	writeJSON(w, h.logger, http.StatusOK, tokenResponse{
-		AccessToken:  accessToken,
-		IDToken:      idToken,
-		RefreshToken: refreshRaw,
+		AccessToken:  tokens.AccessToken,
+		IDToken:      tokens.IDToken,
+		RefreshToken: tokens.RefreshRaw,
 		TokenType:    "Bearer",
 		ExpiresIn:    int(h.accessTTL.Seconds()),
 		Scope:        strings.Join(cibaReq.Scope, " "),

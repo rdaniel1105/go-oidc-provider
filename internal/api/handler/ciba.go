@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/rdaniel1105/go-oidc-provider/internal/ciba"
 	"github.com/rdaniel1105/go-oidc-provider/internal/domain"
 	"github.com/rdaniel1105/go-oidc-provider/internal/notifier"
 	"github.com/rdaniel1105/go-oidc-provider/internal/oidc"
@@ -73,12 +74,13 @@ type opUserByPasskeyIDLookup interface {
 	GetByPasskeyUserID(ctx context.Context, passkeyUserID uuid.UUID) (*domain.OPUser, error)
 }
 
-// cibaCallbackClient captures the OP→RP callback used in ping (and
-// later push) delivery modes. The handler calls it best-effort after a
-// terminal transition; a failure here is logged but does not roll back
-// the approval / denial.
+// cibaCallbackClient captures the OP→RP callback used in ping and push
+// delivery modes. The handler calls it best-effort after a terminal
+// transition; failure is logged but does not roll back the approval /
+// denial — the RP can fall back to polling /oidc/token if push fails.
 type cibaCallbackClient interface {
 	Ping(ctx context.Context, endpoint, clientNotificationToken, authReqID string) error
+	Push(ctx context.Context, endpoint, clientNotificationToken string, payload ciba.PushPayload) error
 }
 
 // CIBAHandler implements POST /oidc/bc-authorize. The flow:
@@ -99,17 +101,28 @@ type CIBAHandler struct {
 	cibaRequests    cibaRequestIssuer
 	cibaRequestsR   cibaRequestReader
 	cibaRequestsT   cibaRequestTransitioner
+	cibaRequestsD   cibaRequestDeleter
 	approvalTks     approvalTokenIssuer
 	approvalTksR    approvalTokenReader
 	approvalTksC    approvalTokenConsumer
 	passkey         passkeyLoginClient
 	notifier        notifier.AuthDeviceNotifier
 	callback        cibaCallbackClient
+	keys            activeKeySource
+	refresh         refreshTokenStore
 	issuer          string
 	defaultTTL      time.Duration
 	pollInterval    int
+	accessTTL       time.Duration
+	refreshTTL      time.Duration
 	callbackTimeout time.Duration
 	logger          *slog.Logger
+}
+
+// cibaRequestDeleter captures the Redis store path used to remove a
+// CIBARequest after a successful push-mode redemption.
+type cibaRequestDeleter interface {
+	Delete(ctx context.Context, authReqID string) error
 }
 
 // CIBAHandlerDeps bundles the collaborators CIBAHandler needs.
@@ -131,6 +144,10 @@ type CIBAHandlerDeps struct {
 	// CIBARequestsTransitioner transitions a pending CIBARequest to its
 	// terminal state (approved or denied).
 	CIBARequestsTransitioner cibaRequestTransitioner
+	// CIBARequestsDeleter removes the CIBARequest after a successful
+	// push-mode delivery so the RP cannot also poll /oidc/token and
+	// receive a second token pair.
+	CIBARequestsDeleter cibaRequestDeleter
 	// ApprovalTokens issues the URL-safe token embedded in the approval URL.
 	ApprovalTokens approvalTokenIssuer
 	// ApprovalTokensReader peeks the URL-safe token without consuming it,
@@ -149,6 +166,17 @@ type CIBAHandlerDeps struct {
 	// nil — in that case the OP behaves as if every client were
 	// configured for poll delivery.
 	Callback cibaCallbackClient
+	// Keys provides the active ES256 signing key used by the push path
+	// to mint tokens at approval time.
+	Keys activeKeySource
+	// Refresh persists refresh-token rows after a successful push
+	// delivery so the RP can rotate via the standard refresh grant.
+	Refresh refreshTokenStore
+	// AccessTTL bounds the access + ID token lifetime for push-mode
+	// minting. Matches the value used at /oidc/token.
+	AccessTTL time.Duration
+	// RefreshTTL bounds the refresh-token lifetime for push-mode minting.
+	RefreshTTL time.Duration
 	// Issuer is the OP issuer URL — the approval URL is built off it.
 	Issuer string
 	// DefaultTTL is the CIBA request TTL used when the RP does not send
@@ -177,27 +205,40 @@ func NewCIBAHandler(deps CIBAHandlerDeps) *CIBAHandler {
 		cibaRequests:    deps.CIBARequests,
 		cibaRequestsR:   deps.CIBARequestsReader,
 		cibaRequestsT:   deps.CIBARequestsTransitioner,
+		cibaRequestsD:   deps.CIBARequestsDeleter,
 		approvalTks:     deps.ApprovalTokens,
 		approvalTksR:    deps.ApprovalTokensReader,
 		approvalTksC:    deps.ApprovalTokensConsumer,
 		passkey:         deps.Passkey,
 		notifier:        deps.Notifier,
 		callback:        deps.Callback,
+		keys:            deps.Keys,
+		refresh:         deps.Refresh,
 		issuer:          deps.Issuer,
 		defaultTTL:      deps.DefaultTTL,
 		pollInterval:    deps.PollInterval,
+		accessTTL:       deps.AccessTTL,
+		refreshTTL:      deps.RefreshTTL,
 		callbackTimeout: timeout,
 		logger:          deps.Logger,
 	}
 }
 
 // notifyClient runs the OP→RP callback for ping- and push-mode clients
-// after a terminal transition. The call is detached from the user's
-// request context (so closing the browser does not cancel the ping)
-// with its own short timeout. Failures are logged but do not roll back
-// the OP-side state: ping clients can still poll /oidc/token, and the
-// CIBARequest stays in its terminal state regardless.
-func (h *CIBAHandler) notifyClient(authReqID string, req *domain.CIBARequest) {
+// after a terminal transition. user may be nil — only push delivery
+// needs it, and Deny never has one to pass. The call is detached from
+// the user's request context (so closing the browser does not cancel
+// the ping) with its own short timeout. Failures are logged but do not
+// roll back the OP-side state: clients can still poll /oidc/token, and
+// the CIBARequest stays in its terminal state regardless.
+//
+// For push delivery: the OP mints a full token set at approval time
+// and POSTs it. On push success the CIBARequest is deleted so the RP
+// cannot also poll and receive a second pair. On push failure the
+// CIBARequest is left in its approved state — polling becomes the
+// fallback, and the refresh row is not persisted, so no orphan
+// credentials survive the failed delivery.
+func (h *CIBAHandler) notifyClient(authReqID string, req *domain.CIBARequest, user *domain.OPUser) {
 	if h.callback == nil || req.ClientNotificationToken == "" {
 		return
 	}
@@ -211,29 +252,91 @@ func (h *CIBAHandler) notifyClient(authReqID string, req *domain.CIBARequest) {
 	if client.BackchannelTokenDeliveryMode == nil {
 		return
 	}
-	if *client.BackchannelTokenDeliveryMode != domain.CIBADeliveryPing &&
-		*client.BackchannelTokenDeliveryMode != domain.CIBADeliveryPush {
+	mode := *client.BackchannelTokenDeliveryMode
+	if mode != domain.CIBADeliveryPing && mode != domain.CIBADeliveryPush {
 		// poll clients are not notified — the RP polls /oidc/token.
 		return
 	}
 	if client.ClientNotificationEndpoint == nil || *client.ClientNotificationEndpoint == "" {
 		h.logger.Warn("ciba callback: client has delivery mode but no endpoint",
-			"client_id", client.ClientID, "mode", *client.BackchannelTokenDeliveryMode)
+			"client_id", client.ClientID, "mode", mode)
 		return
 	}
 
-	// Push-mode bodies (tokens) land in phase 20. For now the body is
-	// the same ping shape — push clients fall back to polling /token,
-	// which still works.
 	ctx, cancel := context.WithTimeout(context.Background(), h.callbackTimeout)
 	defer cancel()
 
-	if err := h.callback.Ping(ctx, *client.ClientNotificationEndpoint, req.ClientNotificationToken, authReqID); err != nil {
-		h.logger.Error("ciba callback ping",
+	// Denial of a push client (user == nil) falls back to a ping body —
+	// the RP has to poll /oidc/token to discover the access_denied
+	// terminal state. Same shape as for ping clients.
+	if mode == domain.CIBADeliveryPing || user == nil || req.Status != domain.CIBAStatusApproved {
+		if err := h.callback.Ping(ctx, *client.ClientNotificationEndpoint, req.ClientNotificationToken, authReqID); err != nil {
+			h.logger.Error("ciba callback ping",
+				"err", err,
+				"client_id", client.ClientID,
+				"endpoint", *client.ClientNotificationEndpoint,
+			)
+		}
+		return
+	}
+
+	// Push approval: mint tokens, push, and only on success persist the
+	// refresh row + delete the CIBARequest.
+	authTime := req.IssuedAt
+	if req.ApprovedAt != nil {
+		authTime = *req.ApprovedAt
+	}
+
+	tokens, err := mintCIBATokens(ctx, mintCIBATokensInput{
+		Client:     client,
+		User:       user,
+		Scope:      req.Scope,
+		AuthTime:   authTime,
+		Issuer:     h.issuer,
+		AccessTTL:  h.accessTTL,
+		RefreshTTL: h.refreshTTL,
+	}, h.keys)
+	if err != nil {
+		h.logger.Error("ciba push: mint tokens", "err", err, "client_id", client.ClientID)
+		return
+	}
+
+	payload := ciba.PushPayload{
+		AuthReqID:    authReqID,
+		AccessToken:  tokens.AccessToken,
+		IDToken:      tokens.IDToken,
+		RefreshToken: tokens.RefreshRaw,
+		TokenType:    "Bearer",
+		ExpiresIn:    int(h.accessTTL.Seconds()),
+		Scope:        strings.Join(req.Scope, " "),
+	}
+
+	if err := h.callback.Push(ctx, *client.ClientNotificationEndpoint, req.ClientNotificationToken, payload); err != nil {
+		h.logger.Error("ciba push: deliver",
 			"err", err,
 			"client_id", client.ClientID,
 			"endpoint", *client.ClientNotificationEndpoint,
 		)
+		// Push failed — leave the CIBARequest approved and the refresh
+		// row unpersisted. The RP can fall back to polling /oidc/token
+		// to recover, which will mint a fresh, persisted token pair.
+		return
+	}
+
+	if err := persistCIBARefreshRow(ctx, h.refresh, client, user, req.Scope, tokens.RefreshHash, authTime, tokens.RefreshExp); err != nil {
+		h.logger.Error("ciba push: persist refresh row after delivery",
+			"err", err, "client_id", client.ClientID)
+		// Tokens are already on the wire. Returning here means the
+		// CIBARequest stays in Redis, and a follow-up poll at /oidc/token
+		// would mint a SECOND refresh row. That's worse than logging
+		// and continuing to delete, so we proceed.
+	}
+
+	if h.cibaRequestsD != nil {
+		if err := h.cibaRequestsD.Delete(ctx, authReqID); err != nil {
+			h.logger.Error("ciba push: delete request after delivery",
+				"err", err, "client_id", client.ClientID, "auth_req_id", authReqID)
+		}
 	}
 }
 
@@ -403,7 +506,13 @@ func (h *CIBAHandler) ApproveSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.notifyClient(authReqID, cibaReq)
+	// Re-read so the freshly stamped Status + ApprovedAt are visible
+	// to the push branch in notifyClient.
+	if fresh, freshErr := h.cibaRequestsR.Get(r.Context(), authReqID); freshErr == nil {
+		h.notifyClient(authReqID, fresh, user)
+	} else {
+		h.notifyClient(authReqID, cibaReq, user)
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -455,7 +564,7 @@ func (h *CIBAHandler) Deny(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cibaReq, err := h.cibaRequestsR.Get(r.Context(), authReqID); err == nil {
-		h.notifyClient(authReqID, cibaReq)
+		h.notifyClient(authReqID, cibaReq, nil)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

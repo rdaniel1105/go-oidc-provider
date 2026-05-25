@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"github.com/rdaniel1105/go-oidc-provider/internal/ciba"
 	"github.com/rdaniel1105/go-oidc-provider/internal/domain"
 	"github.com/rdaniel1105/go-oidc-provider/internal/notifier"
 	"github.com/rdaniel1105/go-oidc-provider/internal/oidc"
@@ -152,6 +153,15 @@ func (f *fakeCIBARequestIssuer) Approve(_ context.Context, authReqID string, at 
 	return nil
 }
 
+// Delete removes the stored request, mirroring the real store's
+// idempotent delete-on-redemption.
+func (f *fakeCIBARequestIssuer) Delete(_ context.Context, authReqID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.stored, authReqID)
+	return nil
+}
+
 // Deny flips the stored request to denied if it is currently pending.
 func (f *fakeCIBARequestIssuer) Deny(_ context.Context, authReqID string, at time.Time) error {
 	f.mu.Lock()
@@ -172,15 +182,23 @@ func (f *fakeCIBARequestIssuer) Deny(_ context.Context, authReqID string, at tim
 // fakeCIBACallback records callbacks the handler initiates to RP
 // notification endpoints.
 type fakeCIBACallback struct {
-	mu    sync.Mutex
-	calls []fakeCIBACallbackCall
-	err   error
+	mu       sync.Mutex
+	calls    []fakeCIBACallbackCall
+	pushes   []fakeCIBAPushCall
+	err      error
+	pushErr  error
 }
 
 type fakeCIBACallbackCall struct {
 	Endpoint                string
 	ClientNotificationToken string
 	AuthReqID               string
+}
+
+type fakeCIBAPushCall struct {
+	Endpoint                string
+	ClientNotificationToken string
+	Payload                 ciba.PushPayload
 }
 
 func (f *fakeCIBACallback) Ping(_ context.Context, endpoint, clientNotificationToken, authReqID string) error {
@@ -192,6 +210,17 @@ func (f *fakeCIBACallback) Ping(_ context.Context, endpoint, clientNotificationT
 		AuthReqID:               authReqID,
 	})
 	return f.err
+}
+
+func (f *fakeCIBACallback) Push(_ context.Context, endpoint, clientNotificationToken string, payload ciba.PushPayload) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pushes = append(f.pushes, fakeCIBAPushCall{
+		Endpoint:                endpoint,
+		ClientNotificationToken: clientNotificationToken,
+		Payload:                 payload,
+	})
+	return f.pushErr
 }
 
 // fakeOPUsersByPasskeyID maps passkey-side user_id → op_user for the
@@ -238,6 +267,8 @@ type cibaHarness struct {
 	passkey        *fakeLoginPasskey
 	notifier       *fakeNotifier
 	callback       *fakeCIBACallback
+	refresh        *fakeRefreshStore
+	keys           *fakeKeySource
 	handler        *CIBAHandler
 }
 
@@ -252,8 +283,16 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 	pk := &fakeLoginPasskey{}
 	n := &fakeNotifier{}
 	cb := &fakeCIBACallback{}
+	refresh := newFakeRefreshStore()
 
-	return &cibaHarness{
+	dir := t.TempDir()
+	ks, err := oidc.NewKeyStore(dir, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+	kid, priv, err := ks.Active()
+	require.NoError(t, err)
+	keys := &fakeKeySource{kid: kid, priv: priv}
+
+	h := &cibaHarness{
 		clients:        clients,
 		users:          users,
 		usersByPasskey: usersByPasskey,
@@ -262,6 +301,8 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 		passkey:        pk,
 		notifier:       n,
 		callback:       cb,
+		refresh:        refresh,
+		keys:           keys,
 		handler: NewCIBAHandler(CIBAHandlerDeps{
 			Clients:                  clients,
 			Users:                    users,
@@ -269,18 +310,24 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 			CIBARequests:             cibaReqs,
 			CIBARequestsReader:       cibaReqs,
 			CIBARequestsTransitioner: cibaReqs,
+			CIBARequestsDeleter:      cibaReqs,
 			ApprovalTokens:           approvals,
 			ApprovalTokensReader:     approvals,
 			ApprovalTokensConsumer:   approvals,
 			Passkey:                  pk,
 			Notifier:                 n,
 			Callback:                 cb,
+			Keys:                     keys,
+			Refresh:                  refresh,
 			Issuer:                   "http://op.local:8081",
 			DefaultTTL:               10 * time.Minute,
 			PollInterval:             5,
+			AccessTTL:                time.Hour,
+			RefreshTTL:               720 * time.Hour,
 			Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}),
 	}
+	return h
 }
 
 func seedCIBAClient(t *testing.T, h *cibaHarness) {
@@ -1075,4 +1122,112 @@ func TestApproveSubmit_PingClient_WithoutEndpoint_SilentlySkipped(t *testing.T) 
 	})
 	c.Equal(http.StatusNoContent, rr.Code)
 	c.Empty(h.callback.calls)
+}
+
+// --- Push mode callback ---
+
+func setClientPushMode(t *testing.T, h *cibaHarness, endpoint string) {
+	t.Helper()
+	mode := domain.CIBADeliveryPush
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ID:                           uuid.New(),
+		ClientID:                     "demo-rp",
+		ClientSecretHash:             bcryptHash(t, "super-secret"),
+		GrantTypes:                   []string{oidc.CIBAGrantType},
+		Scopes:                       []string{"openid", "payment"},
+		TokenEndpointAuthMethod:      domain.AuthMethodClientSecretBasic,
+		BackchannelTokenDeliveryMode: &mode,
+		ClientNotificationEndpoint:   &endpoint,
+	}
+}
+
+func TestApproveSubmit_PushClient_DeliversTokensAndDeletesRequest(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	setClientPushMode(t, h, "https://rp.example.com/notify")
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code)
+
+	// Ping must NOT have been called for a push client.
+	c.Empty(h.callback.calls)
+
+	c.Len(h.callback.pushes, 1)
+	pushed := h.callback.pushes[0]
+	c.Equal("https://rp.example.com/notify", pushed.Endpoint)
+	c.Equal("rp-correlation-id", pushed.ClientNotificationToken)
+	c.Equal(authReqID, pushed.Payload.AuthReqID)
+	c.Equal("Bearer", pushed.Payload.TokenType)
+	c.Equal(3600, pushed.Payload.ExpiresIn)
+	c.Equal("openid payment", pushed.Payload.Scope)
+	c.NotEmpty(pushed.Payload.AccessToken)
+	c.NotEmpty(pushed.Payload.IDToken)
+	c.NotEmpty(pushed.Payload.RefreshToken)
+
+	// Refresh row persisted with the matching hash.
+	c.Len(h.refresh.created, 1)
+	c.Equal(oidc.HashRefreshToken(pushed.Payload.RefreshToken), h.refresh.created[0].TokenHash)
+
+	// CIBARequest deleted so a poll cannot mint a second pair.
+	_, ok := h.cibaReqs.stored[authReqID]
+	c.False(ok)
+}
+
+func TestApproveSubmit_PushFailure_LeavesPollFallback(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	setClientPushMode(t, h, "https://rp.example.com/notify")
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+	h.callback.pushErr = errors.New("RP is down")
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code)
+
+	// Push was attempted...
+	c.Len(h.callback.pushes, 1)
+
+	// ...but the refresh row was NOT persisted and the CIBARequest is
+	// still around so the RP can fall back to polling.
+	c.Empty(h.refresh.created, "no orphan refresh row on push failure")
+	saved, ok := h.cibaReqs.stored[authReqID]
+	c.True(ok)
+	c.Equal(domain.CIBAStatusApproved, saved.Status)
+}
+
+func TestDeny_PushClient_FallsBackToPing(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, _ := seedApprovalReady(t, h)
+
+	setClientPushMode(t, h, "https://rp.example.com/notify")
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+
+	rr := postJSONHandler(t, h.handler.Deny, map[string]string{"t": tok})
+	c.Equal(http.StatusNoContent, rr.Code)
+
+	// Denial on a push client triggers a ping body (auth_req_id only) —
+	// the RP polls /oidc/token to learn the access_denied terminal.
+	c.Len(h.callback.calls, 1)
+	c.Empty(h.callback.pushes)
 }
