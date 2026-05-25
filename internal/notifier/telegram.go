@@ -9,6 +9,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -83,11 +84,14 @@ type inlineKeyboardMarkup struct {
 }
 
 // sendMessageRequest is the body for Telegram's sendMessage method.
+// ReplyMarkup is omitted when nil so the OP can send a plain-text
+// fallback for URLs Telegram would reject as inline buttons (notably
+// http://localhost during local development).
 type sendMessageRequest struct {
-	ChatID      string               `json:"chat_id"`
-	Text        string               `json:"text"`
-	ParseMode   string               `json:"parse_mode"`
-	ReplyMarkup inlineKeyboardMarkup `json:"reply_markup"`
+	ChatID      string                `json:"chat_id"`
+	Text        string                `json:"text"`
+	ParseMode   string                `json:"parse_mode"`
+	ReplyMarkup *inlineKeyboardMarkup `json:"reply_markup,omitempty"`
 }
 
 // sendMessageResponse is the envelope every Telegram API response uses.
@@ -98,20 +102,25 @@ type sendMessageResponse struct {
 }
 
 // Notify sends the approval URL to the configured chat id as a Telegram
-// message with an inline "Authorize" button. Returns ErrTelegramAPI for
-// any non-ok response from the Bot API.
+// message with an inline "Authorize" button when the URL is HTTPS, or
+// the URL inline in the message body for non-HTTPS URLs (Telegram's API
+// refuses non-HTTPS inline-button URLs, including http://localhost). The
+// URL is always present in the text body too so the user can click /
+// copy it even when the button is omitted.
 func (n *TelegramNotifier) Notify(ctx context.Context, in Notification) error {
 	req := sendMessageRequest{
 		ChatID:    n.defaultChatID,
 		Text:      formatTelegramText(in),
 		ParseMode: "HTML",
-		ReplyMarkup: inlineKeyboardMarkup{
+	}
+	if strings.HasPrefix(in.ApprovalURL, "https://") {
+		req.ReplyMarkup = &inlineKeyboardMarkup{
 			InlineKeyboard: [][]inlineKeyboardButton{
 				{
 					{Text: "Authorize", URL: in.ApprovalURL},
 				},
 			},
-		},
+		}
 	}
 
 	body, err := json.Marshal(req)
@@ -151,13 +160,15 @@ func (n *TelegramNotifier) Notify(ctx context.Context, in Notification) error {
 }
 
 // formatTelegramText composes the human-readable body of the Telegram
-// message. parse_mode=HTML lets us bold the binding message and italicize
-// the RP name; the URL goes on the inline button rather than in the text
-// so the message stays readable on small screens.
+// message. parse_mode=HTML lets us bold the binding message and
+// italicize the RP name; the approval URL appears at the bottom so
+// Telegram's auto-linkification makes it tappable even when the inline
+// button is omitted (the button is only added for https URLs).
 func formatTelegramText(in Notification) string {
 	return fmt.Sprintf(
-		"<b>Authorization request</b>\nFrom: <i>%s</i>\n\n%s",
+		"<b>Authorization request</b>\nFrom: <i>%s</i>\n\n%s\n\n%s",
 		html.EscapeString(in.ClientName),
 		html.EscapeString(in.BindingMessage),
+		html.EscapeString(in.ApprovalURL),
 	)
 }

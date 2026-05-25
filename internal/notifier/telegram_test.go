@@ -121,6 +121,30 @@ func TestTelegramNotifier_PathEmbedsBotToken(t *testing.T) {
 	c.Equal("/botabc:123/sendMessage", capturedPath)
 }
 
+func TestTelegramNotifier_LocalhostURL_OmitsInlineButton(t *testing.T) {
+	c := require.New(t)
+
+	srv, captured, _ := newTelegramFake(t, true, 0, "")
+
+	n := NewTelegramNotifier("test-bot-token", "555",
+		WithTelegramAPIRoot(srv.URL),
+	)
+
+	c.NoError(n.Notify(context.Background(), Notification{
+		User:           sampleUser(),
+		ClientName:     "Demo RP",
+		BindingMessage: "Authorize $50",
+		ApprovalURL:    "http://localhost:8081/ciba/approve?t=abc",
+	}))
+
+	// Telegram refuses http://localhost as an inline-button URL; the
+	// notifier must drop the keyboard and rely on the auto-linkified
+	// URL in the message body instead.
+	c.Nil(captured.ReplyMarkup, "http URLs must not produce an inline button")
+	c.Contains(captured.Text, "http://localhost:8081/ciba/approve?t=abc",
+		"URL must appear in the text body so the user can still tap it")
+}
+
 func TestFormatTelegramText_EscapesHTML(t *testing.T) {
 	c := require.New(t)
 	user := sampleUser()
