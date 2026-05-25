@@ -45,8 +45,13 @@ type fakeCIBARequestIssuer struct {
 		Req domain.CIBARequest
 		TTL time.Duration
 	}
+	stored map[string]*domain.CIBARequest
 	nextID string
 	err    error
+}
+
+func newFakeCIBARequestIssuer() *fakeCIBARequestIssuer {
+	return &fakeCIBARequestIssuer{stored: map[string]*domain.CIBARequest{}}
 }
 
 func (f *fakeCIBARequestIssuer) Issue(_ context.Context, req domain.CIBARequest, ttl time.Duration) (string, error) {
@@ -59,17 +64,38 @@ func (f *fakeCIBARequestIssuer) Issue(_ context.Context, req domain.CIBARequest,
 		Req domain.CIBARequest
 		TTL time.Duration
 	}{req, ttl})
-	if f.nextID == "" {
-		return uuid.NewString(), nil
+	id := f.nextID
+	if id == "" {
+		id = uuid.NewString()
 	}
-	return f.nextID, nil
+	stamped := req
+	stamped.Status = domain.CIBAStatusPending
+	stamped.IssuedAt = time.Now().UTC()
+	f.stored[id] = &stamped
+	return id, nil
+}
+
+func (f *fakeCIBARequestIssuer) Get(_ context.Context, authReqID string) (*domain.CIBARequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.stored[authReqID]
+	if !ok {
+		return nil, domain.ErrCIBARequestNotFound
+	}
+	cp := *r
+	return &cp, nil
 }
 
 type fakeApprovalTokens struct {
 	mu     sync.Mutex
 	issued []string
+	bound  map[string]string // token -> authReqID
 	next   string
 	err    error
+}
+
+func newFakeApprovalTokens() *fakeApprovalTokens {
+	return &fakeApprovalTokens{bound: map[string]string{}}
 }
 
 func (f *fakeApprovalTokens) Issue(_ context.Context, authReqID string) (string, error) {
@@ -79,10 +105,22 @@ func (f *fakeApprovalTokens) Issue(_ context.Context, authReqID string) (string,
 		return "", f.err
 	}
 	f.issued = append(f.issued, authReqID)
-	if f.next == "" {
-		return "tok-" + authReqID, nil
+	token := f.next
+	if token == "" {
+		token = "tok-" + authReqID
 	}
-	return f.next, nil
+	f.bound[token] = authReqID
+	return token, nil
+}
+
+func (f *fakeApprovalTokens) Peek(_ context.Context, token string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.bound[token]
+	if !ok {
+		return "", domain.ErrApprovalTokenNotFound
+	}
+	return id, nil
 }
 
 type fakeNotifier struct {
@@ -117,8 +155,8 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 	users := &fakeOPUsersByEmail{byEmail: map[string]*domain.OPUser{}}
-	cibaReqs := &fakeCIBARequestIssuer{}
-	approvals := &fakeApprovalTokens{}
+	cibaReqs := newFakeCIBARequestIssuer()
+	approvals := newFakeApprovalTokens()
 	n := &fakeNotifier{}
 
 	return &cibaHarness{
@@ -128,13 +166,15 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 		approvalTks: approvals,
 		notifier:    n,
 		handler: NewCIBAHandler(CIBAHandlerDeps{
-			Clients:        clients,
-			Users:          users,
-			CIBARequests:   cibaReqs,
-			ApprovalTokens: approvals,
-			Notifier:       n,
-			Issuer:         "http://op.local:8081",
-			DefaultTTL:     10 * time.Minute,
+			Clients:              clients,
+			Users:                users,
+			CIBARequests:         cibaReqs,
+			CIBARequestsReader:   cibaReqs,
+			ApprovalTokens:       approvals,
+			ApprovalTokensReader: approvals,
+			Notifier:             n,
+			Issuer:               "http://op.local:8081",
+			DefaultTTL:           10 * time.Minute,
 			PollInterval:   5,
 			Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}),
@@ -415,4 +455,132 @@ func TestParseRequestedExpiry(t *testing.T) {
 	c.Equal(0, parseRequestedExpiry(""))
 	c.Equal(0, parseRequestedExpiry("not-a-number"))
 	c.Equal(300, parseRequestedExpiry("300"))
+}
+
+// --- GET /ciba/approve ---
+
+func TestApprove_RendersPageWithBinding(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	// Seed the stores by going through bc-authorize so the binding
+	// message + approval token round-trip honestly.
+	seedCIBAClient(t, h)
+	seedCIBAUser(t, h)
+	h.cibaReqs.nextID = "auth-req-xyz"
+	h.approvalTks.next = "tok-abc"
+
+	rr := postCIBA(t, h.handler, bcAuthorizeForm(), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusOK, rr.Code)
+
+	req := httptest.NewRequest(http.MethodGet, "/ciba/approve?t=tok-abc", nil)
+	rec := httptest.NewRecorder()
+	h.handler.Approve(rec, req)
+
+	c.Equal(http.StatusOK, rec.Code)
+	c.Contains(rec.Header().Get("Content-Type"), "text/html")
+	c.Equal("no-store", rec.Header().Get("Cache-Control"))
+	body := rec.Body.String()
+	c.Contains(body, "Authorize $50 to Café Acme")
+	c.Contains(body, "demo-rp")
+	c.Contains(body, "tok-abc", "approval token must be embedded for the form submit")
+	c.Contains(body, "/ciba/approve/login/begin")
+	c.Contains(body, "/ciba/deny")
+}
+
+func TestApprove_MissingToken(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/ciba/approve", nil)
+	rec := httptest.NewRecorder()
+	h.handler.Approve(rec, req)
+
+	c.Equal(http.StatusBadRequest, rec.Code)
+	c.Contains(rec.Body.String(), "missing")
+}
+
+func TestApprove_UnknownToken(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/ciba/approve?t=never-issued", nil)
+	rec := httptest.NewRecorder()
+	h.handler.Approve(rec, req)
+
+	c.Equal(http.StatusNotFound, rec.Code)
+	c.Contains(rec.Body.String(), "expired or already been used")
+}
+
+func TestApprove_AlreadyApproved(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	// Bypass bc-authorize: seed the stores directly so we can flip
+	// the status to approved.
+	h.approvalTks.bound["tok-a"] = "auth-req-1"
+	now := time.Now().UTC()
+	h.cibaReqs.stored["auth-req-1"] = &domain.CIBARequest{
+		ClientID:       "demo-rp",
+		OPUserID:       uuid.New(),
+		Scope:          []string{"openid"},
+		BindingMessage: "Already done",
+		Status:         domain.CIBAStatusApproved,
+		IssuedAt:       now,
+		ApprovedAt:     &now,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/ciba/approve?t=tok-a", nil)
+	rec := httptest.NewRecorder()
+	h.handler.Approve(rec, req)
+
+	c.Equal(http.StatusOK, rec.Code)
+	c.Contains(rec.Body.String(), "already authorized")
+	c.NotContains(rec.Body.String(), "Already done",
+		"terminal page must not echo the binding message to drive-by visitors")
+}
+
+func TestApprove_AlreadyDenied(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	h.approvalTks.bound["tok-d"] = "auth-req-2"
+	now := time.Now().UTC()
+	h.cibaReqs.stored["auth-req-2"] = &domain.CIBARequest{
+		ClientID:       "demo-rp",
+		OPUserID:       uuid.New(),
+		Scope:          []string{"openid"},
+		BindingMessage: "Not happening",
+		Status:         domain.CIBAStatusDenied,
+		IssuedAt:       now,
+		DeniedAt:       &now,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/ciba/approve?t=tok-d", nil)
+	rec := httptest.NewRecorder()
+	h.handler.Approve(rec, req)
+
+	c.Equal(http.StatusOK, rec.Code)
+	c.Contains(rec.Body.String(), "already denied")
+}
+
+func TestApprove_PeekDoesNotConsumeOnReload(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	h.approvalTks.bound["tok-reload"] = "auth-req-3"
+	now := time.Now().UTC()
+	h.cibaReqs.stored["auth-req-3"] = &domain.CIBARequest{
+		ClientID:       "demo-rp",
+		BindingMessage: "Authorize $50",
+		Status:         domain.CIBAStatusPending,
+		IssuedAt:       now,
+	}
+
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/ciba/approve?t=tok-reload", nil)
+		rec := httptest.NewRecorder()
+		h.handler.Approve(rec, req)
+		c.Equal(http.StatusOK, rec.Code, "reload %d must still render", i+1)
+	}
 }

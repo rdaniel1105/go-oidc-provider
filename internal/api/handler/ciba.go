@@ -32,6 +32,21 @@ type approvalTokenIssuer interface {
 	Issue(ctx context.Context, authReqID string) (string, error)
 }
 
+// approvalTokenReader captures the read side of the approval-token store.
+// Peek (not Consume) is used on the GET /ciba/approve page render so a
+// reload does not invalidate the pending approval; the single-use
+// guarantee lives at Consume on the POST.
+type approvalTokenReader interface {
+	Peek(ctx context.Context, token string) (string, error)
+}
+
+// cibaRequestReader captures the read side of the CIBARequest store
+// used by GET /ciba/approve to render the binding message the user is
+// being asked to authorize.
+type cibaRequestReader interface {
+	Get(ctx context.Context, authReqID string) (*domain.CIBARequest, error)
+}
+
 // CIBAHandler implements POST /oidc/bc-authorize. The flow:
 //  1. authenticate the client
 //  2. validate the request against the registered client
@@ -44,15 +59,17 @@ type approvalTokenIssuer interface {
 // If the notifier fails the request is rejected synchronously so the RP
 // sees the problem immediately rather than after a long polling timeout.
 type CIBAHandler struct {
-	clients      oidc.ClientLookup
-	users        opUserByEmail
-	cibaRequests cibaRequestIssuer
-	approvalTks  approvalTokenIssuer
-	notifier     notifier.AuthDeviceNotifier
-	issuer       string
-	defaultTTL   time.Duration
-	pollInterval int
-	logger       *slog.Logger
+	clients         oidc.ClientLookup
+	users           opUserByEmail
+	cibaRequests    cibaRequestIssuer
+	cibaRequestsR   cibaRequestReader
+	approvalTks     approvalTokenIssuer
+	approvalTksR    approvalTokenReader
+	notifier        notifier.AuthDeviceNotifier
+	issuer          string
+	defaultTTL      time.Duration
+	pollInterval    int
+	logger          *slog.Logger
 }
 
 // CIBAHandlerDeps bundles the collaborators CIBAHandler needs.
@@ -64,8 +81,14 @@ type CIBAHandlerDeps struct {
 	Users opUserByEmail
 	// CIBARequests issues new auth_req_id-keyed CIBARequest payloads.
 	CIBARequests cibaRequestIssuer
+	// CIBARequestsReader reads existing CIBARequests by auth_req_id, used
+	// by the approval page to display the binding message.
+	CIBARequestsReader cibaRequestReader
 	// ApprovalTokens issues the URL-safe token embedded in the approval URL.
 	ApprovalTokens approvalTokenIssuer
+	// ApprovalTokensReader peeks the URL-safe token without consuming it,
+	// used by the approval page render.
+	ApprovalTokensReader approvalTokenReader
 	// Notifier delivers the approval URL to the user's device.
 	Notifier notifier.AuthDeviceNotifier
 	// Issuer is the OP issuer URL — the approval URL is built off it.
@@ -83,15 +106,107 @@ type CIBAHandlerDeps struct {
 // NewCIBAHandler returns a CIBAHandler from its dependencies.
 func NewCIBAHandler(deps CIBAHandlerDeps) *CIBAHandler {
 	return &CIBAHandler{
-		clients:      deps.Clients,
-		users:        deps.Users,
-		cibaRequests: deps.CIBARequests,
-		approvalTks:  deps.ApprovalTokens,
-		notifier:     deps.Notifier,
-		issuer:       deps.Issuer,
-		defaultTTL:   deps.DefaultTTL,
-		pollInterval: deps.PollInterval,
-		logger:       deps.Logger,
+		clients:       deps.Clients,
+		users:         deps.Users,
+		cibaRequests:  deps.CIBARequests,
+		cibaRequestsR: deps.CIBARequestsReader,
+		approvalTks:   deps.ApprovalTokens,
+		approvalTksR:  deps.ApprovalTokensReader,
+		notifier:      deps.Notifier,
+		issuer:        deps.Issuer,
+		defaultTTL:    deps.DefaultTTL,
+		pollInterval:  deps.PollInterval,
+		logger:        deps.Logger,
+	}
+}
+
+// Approve handles GET /ciba/approve?t=<approval_token>. The page itself
+// is server-rendered HTML — there is no API surface other than the
+// passkey ceremony endpoints the page calls when the user taps
+// Authorize or Deny.
+//
+// Peek (not Consume) is used here so a page reload does not invalidate
+// a pending approval; the single-use guarantee lives at POST
+// /ciba/approve and POST /ciba/deny.
+func (h *CIBAHandler) Approve(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("t")
+	if token == "" {
+		renderApprovalErrorPage(w, h.logger, http.StatusBadRequest,
+			"This link is missing its token. Reopen the message you received.")
+		return
+	}
+
+	authReqID, err := h.approvalTksR.Peek(r.Context(), token)
+	if errors.Is(err, domain.ErrApprovalTokenNotFound) {
+		renderApprovalErrorPage(w, h.logger, http.StatusNotFound,
+			"This approval link has expired or already been used. Ask the app to send a new one.")
+		return
+	}
+	if err != nil {
+		h.logger.Error("approve: peek approval token", "err", err)
+		renderApprovalErrorPage(w, h.logger, http.StatusInternalServerError, "Internal error.")
+		return
+	}
+
+	req, err := h.cibaRequestsR.Get(r.Context(), authReqID)
+	if errors.Is(err, domain.ErrCIBARequestNotFound) {
+		renderApprovalErrorPage(w, h.logger, http.StatusNotFound,
+			"The request behind this link has expired. Ask the app to start a new one.")
+		return
+	}
+	if err != nil {
+		h.logger.Error("approve: load ciba request", "err", err)
+		renderApprovalErrorPage(w, h.logger, http.StatusInternalServerError, "Internal error.")
+		return
+	}
+
+	switch req.Status {
+	case domain.CIBAStatusApproved:
+		renderApprovalTerminalPage(w, h.logger, "This request was already authorized.")
+		return
+	case domain.CIBAStatusDenied:
+		renderApprovalTerminalPage(w, h.logger, "This request was already denied.")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := templates.ExecuteTemplate(w, "approval.html", map[string]string{
+		"ClientName":     req.ClientID,
+		"BindingMessage": req.BindingMessage,
+		"ApprovalToken":  token,
+	}); err != nil {
+		h.logger.Error("approve: render approval", "err", err)
+	}
+}
+
+// renderApprovalErrorPage shows a minimal HTML page when the approval
+// URL is broken (missing token, expired token, missing CIBA request).
+func renderApprovalErrorPage(w http.ResponseWriter, logger *slog.Logger, status int, description string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+
+	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Approval unavailable</title></head><body style="font-family:system-ui,sans-serif;max-width:480px;margin:4rem auto;padding:0 1rem;color:#0f172a;"><h1 style="font-size:1.25rem;">Approval unavailable</h1><p>` +
+		htmlEscape(description) + `</p></body></html>`
+
+	if _, err := w.Write([]byte(body)); err != nil {
+		logger.Error("approve: write error page", "err", err)
+	}
+}
+
+// renderApprovalTerminalPage shows a minimal HTML page for already-
+// approved or already-denied requests reached via the URL after the
+// fact (e.g. user clicks the link from chat history).
+func renderApprovalTerminalPage(w http.ResponseWriter, logger *slog.Logger, description string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	body := `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Already decided</title></head><body style="font-family:system-ui,sans-serif;max-width:480px;margin:4rem auto;padding:0 1rem;color:#0f172a;"><h1 style="font-size:1.25rem;">Already decided</h1><p>` +
+		htmlEscape(description) + `</p></body></html>`
+
+	if _, err := w.Write([]byte(body)); err != nil {
+		logger.Error("approve: write terminal page", "err", err)
 	}
 }
 

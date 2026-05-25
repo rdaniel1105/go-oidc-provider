@@ -44,6 +44,23 @@ func (s *ApprovalTokenStore) Issue(ctx context.Context, authReqID string) (strin
 	return token, nil
 }
 
+// Peek returns the auth_req_id bound to the token without consuming it.
+// Use this on the GET /ciba/approve page render so a page reload does
+// not invalidate the user's pending approval — the actual single-use
+// guarantee is enforced at Consume (POST /ciba/approve).
+func (s *ApprovalTokenStore) Peek(ctx context.Context, token string) (string, error) {
+	raw, err := s.client.Get(ctx, approvalTokenKeyPrefix+token).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", domain.ErrApprovalTokenNotFound
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("get approval token: %w", err)
+	}
+
+	return raw, nil
+}
+
 // Consume atomically reads and deletes the approval token, returning the
 // bound auth_req_id. Returns ErrApprovalTokenNotFound if the token is
 // missing, expired, or already consumed.

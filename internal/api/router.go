@@ -68,5 +68,9 @@ func New(deps Deps) http.Handler {
 		r.Post("/bc-authorize", deps.CIBA.BCAuthorize)
 	})
 
+	r.Route("/ciba", func(r chi.Router) {
+		r.Get("/approve", deps.CIBA.Approve)
+	})
+
 	return r
 }
