@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -9,9 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/rdaniel1105/go-oidc-provider/internal/domain"
 	"github.com/rdaniel1105/go-oidc-provider/internal/notifier"
 	"github.com/rdaniel1105/go-oidc-provider/internal/oidc"
+	"github.com/rdaniel1105/go-oidc-provider/internal/passkey"
 )
 
 // opUserByEmail captures the op_user store's GetByEmail path used to
@@ -47,6 +51,28 @@ type cibaRequestReader interface {
 	Get(ctx context.Context, authReqID string) (*domain.CIBARequest, error)
 }
 
+// approvalTokenConsumer captures the single-use consume path. Action
+// endpoints (POST /ciba/approve, POST /ciba/deny) consume the token so
+// only one terminal action can land per pending request.
+type approvalTokenConsumer interface {
+	Consume(ctx context.Context, token string) (string, error)
+}
+
+// cibaRequestTransitioner captures the state-transition path of the
+// CIBARequest store. The store enforces "Pending only" semantics, so
+// the handler does not need its own check beyond mapping ErrCIBANotPending.
+type cibaRequestTransitioner interface {
+	Approve(ctx context.Context, authReqID string, at time.Time) error
+	Deny(ctx context.Context, authReqID string, at time.Time) error
+}
+
+// opUserByPasskeyIDLookup captures the op_user store's GetByPasskeyUserID
+// path used after a successful passkey assertion to map the passkey-side
+// user back to an op_user.
+type opUserByPasskeyIDLookup interface {
+	GetByPasskeyUserID(ctx context.Context, passkeyUserID uuid.UUID) (*domain.OPUser, error)
+}
+
 // CIBAHandler implements POST /oidc/bc-authorize. The flow:
 //  1. authenticate the client
 //  2. validate the request against the registered client
@@ -61,10 +87,14 @@ type cibaRequestReader interface {
 type CIBAHandler struct {
 	clients         oidc.ClientLookup
 	users           opUserByEmail
+	usersByPasskey  opUserByPasskeyIDLookup
 	cibaRequests    cibaRequestIssuer
 	cibaRequestsR   cibaRequestReader
+	cibaRequestsT   cibaRequestTransitioner
 	approvalTks     approvalTokenIssuer
 	approvalTksR    approvalTokenReader
+	approvalTksC    approvalTokenConsumer
+	passkey         passkeyLoginClient
 	notifier        notifier.AuthDeviceNotifier
 	issuer          string
 	defaultTTL      time.Duration
@@ -79,16 +109,29 @@ type CIBAHandlerDeps struct {
 	Clients oidc.ClientLookup
 	// Users resolves login_hint (email) into an op_user.
 	Users opUserByEmail
+	// UsersByPasskey resolves the passkey-side user_id returned by the
+	// passkey service into an op_user, used to enforce the login_hint
+	// match at approval time.
+	UsersByPasskey opUserByPasskeyIDLookup
 	// CIBARequests issues new auth_req_id-keyed CIBARequest payloads.
 	CIBARequests cibaRequestIssuer
 	// CIBARequestsReader reads existing CIBARequests by auth_req_id, used
 	// by the approval page to display the binding message.
 	CIBARequestsReader cibaRequestReader
+	// CIBARequestsTransitioner transitions a pending CIBARequest to its
+	// terminal state (approved or denied).
+	CIBARequestsTransitioner cibaRequestTransitioner
 	// ApprovalTokens issues the URL-safe token embedded in the approval URL.
 	ApprovalTokens approvalTokenIssuer
 	// ApprovalTokensReader peeks the URL-safe token without consuming it,
 	// used by the approval page render.
 	ApprovalTokensReader approvalTokenReader
+	// ApprovalTokensConsumer consumes the URL-safe token at terminal
+	// actions (POST /ciba/approve, POST /ciba/deny) to enforce single-use.
+	ApprovalTokensConsumer approvalTokenConsumer
+	// Passkey is the HTTP client used to broker BeginLogin / CompleteLogin
+	// against go-passkey-auth during the approval ceremony.
+	Passkey passkeyLoginClient
 	// Notifier delivers the approval URL to the user's device.
 	Notifier notifier.AuthDeviceNotifier
 	// Issuer is the OP issuer URL — the approval URL is built off it.
@@ -106,17 +149,269 @@ type CIBAHandlerDeps struct {
 // NewCIBAHandler returns a CIBAHandler from its dependencies.
 func NewCIBAHandler(deps CIBAHandlerDeps) *CIBAHandler {
 	return &CIBAHandler{
-		clients:       deps.Clients,
-		users:         deps.Users,
-		cibaRequests:  deps.CIBARequests,
-		cibaRequestsR: deps.CIBARequestsReader,
-		approvalTks:   deps.ApprovalTokens,
-		approvalTksR:  deps.ApprovalTokensReader,
-		notifier:      deps.Notifier,
-		issuer:        deps.Issuer,
-		defaultTTL:    deps.DefaultTTL,
-		pollInterval:  deps.PollInterval,
-		logger:        deps.Logger,
+		clients:        deps.Clients,
+		users:          deps.Users,
+		usersByPasskey: deps.UsersByPasskey,
+		cibaRequests:   deps.CIBARequests,
+		cibaRequestsR:  deps.CIBARequestsReader,
+		cibaRequestsT:  deps.CIBARequestsTransitioner,
+		approvalTks:    deps.ApprovalTokens,
+		approvalTksR:   deps.ApprovalTokensReader,
+		approvalTksC:   deps.ApprovalTokensConsumer,
+		passkey:        deps.Passkey,
+		notifier:       deps.Notifier,
+		issuer:         deps.Issuer,
+		defaultTTL:     deps.DefaultTTL,
+		pollInterval:   deps.PollInterval,
+		logger:         deps.Logger,
+	}
+}
+
+// approveLoginBeginRequest is the body of POST /ciba/approve/login/begin.
+type approveLoginBeginRequest struct {
+	Token string `json:"t"`
+}
+
+// approveLoginBeginResponse mirrors the passkey service's BeginLogin
+// shape (options + session id) so the page can call
+// navigator.credentials.get directly.
+type approveLoginBeginResponse struct {
+	Options   json.RawMessage `json:"options"`
+	SessionID string          `json:"session_id"`
+}
+
+// LoginBegin handles POST /ciba/approve/login/begin. It peeks the
+// approval token (so an expired or already-decided request fails fast
+// without burning a passkey prompt), then proxies BeginLogin to the
+// passkey service.
+func (h *CIBAHandler) LoginBegin(w http.ResponseWriter, r *http.Request) {
+	var req approveLoginBeginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_request",
+			"approval token is required")
+		return
+	}
+
+	if _, err := h.approvalTksR.Peek(r.Context(), req.Token); err != nil {
+		if errors.Is(err, domain.ErrApprovalTokenNotFound) {
+			writeError(w, h.logger, http.StatusUnauthorized, "session_invalid",
+				"this approval link has expired or already been used")
+			return
+		}
+		h.logger.Error("approve: peek approval token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	begin, err := h.passkey.BeginLogin(r.Context())
+	if err != nil {
+		h.mapPasskeyError(w, "approve login begin", err)
+		return
+	}
+
+	writeJSON(w, h.logger, http.StatusOK, approveLoginBeginResponse{
+		Options:   begin.Options,
+		SessionID: begin.SessionID,
+	})
+}
+
+// approveRequest is the body of POST /ciba/approve.
+type approveRequest struct {
+	Token            string          `json:"t"`
+	PasskeySessionID string          `json:"passkey_session_id"`
+	Credential       json.RawMessage `json:"credential"`
+}
+
+// ApproveSubmit handles POST /ciba/approve. The flow:
+//  1. consume the approval token (single-use)
+//  2. load the CIBARequest the token refers to
+//  3. broker CompleteLogin to the passkey service
+//  4. map the returned passkey_user_id back to an op_user
+//  5. verify that op_user matches the one /bc-authorize resolved
+//     (PRD §7's login_hint match — blocks an attacker who stole the URL
+//     from authorizing the request with their own passkey)
+//  6. transition the CIBARequest to approved
+func (h *CIBAHandler) ApproveSubmit(w http.ResponseWriter, r *http.Request) {
+	var req approveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_request",
+			"request body is not valid JSON")
+		return
+	}
+	if req.Token == "" || req.PasskeySessionID == "" || len(req.Credential) == 0 {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_request",
+			"t, passkey_session_id, and credential are required")
+		return
+	}
+
+	authReqID, err := h.approvalTksC.Consume(r.Context(), req.Token)
+	if errors.Is(err, domain.ErrApprovalTokenNotFound) {
+		writeError(w, h.logger, http.StatusUnauthorized, "session_invalid",
+			"approval link expired or already used")
+		return
+	}
+	if err != nil {
+		h.logger.Error("approve: consume approval token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	cibaReq, err := h.cibaRequestsR.Get(r.Context(), authReqID)
+	if errors.Is(err, domain.ErrCIBARequestNotFound) {
+		writeError(w, h.logger, http.StatusGone, "request_expired",
+			"the underlying request has expired")
+		return
+	}
+	if err != nil {
+		h.logger.Error("approve: load ciba request", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+	if cibaReq.Status != domain.CIBAStatusPending {
+		writeError(w, h.logger, http.StatusConflict, "already_decided",
+			"this request is no longer pending")
+		return
+	}
+
+	complete, err := h.passkey.CompleteLogin(r.Context(), passkey.CompleteLoginRequest{
+		SessionID:  req.PasskeySessionID,
+		Credential: req.Credential,
+	})
+	if err != nil {
+		h.mapPasskeyError(w, "approve login complete", err)
+		return
+	}
+
+	passkeyUserID, err := uuid.Parse(complete.UserID)
+	if err != nil {
+		h.logger.Error("approve: parse passkey user_id", "err", err, "raw", complete.UserID)
+		writeError(w, h.logger, http.StatusBadGateway, "service_unavailable",
+			"passkey service returned an invalid user_id")
+		return
+	}
+
+	user, err := h.usersByPasskey.GetByPasskeyUserID(r.Context(), passkeyUserID)
+	if errors.Is(err, domain.ErrOPUserNotFound) {
+		writeError(w, h.logger, http.StatusForbidden, "user_mismatch",
+			"this passkey is not linked to an account on this provider")
+		return
+	}
+	if err != nil {
+		h.logger.Error("approve: lookup op_user", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	if user.ID != cibaReq.OPUserID {
+		// The asserted passkey belongs to a different op_user than the
+		// one the original /bc-authorize resolved from login_hint. This
+		// is the spec's "different-user-took-over" attack — reject hard
+		// and never reveal which user the request was meant for.
+		h.logger.Warn("approve: user mismatch",
+			"expected_op_user_id", cibaReq.OPUserID,
+			"asserted_op_user_id", user.ID,
+			"auth_req_id", authReqID,
+		)
+		writeError(w, h.logger, http.StatusForbidden, "user_mismatch",
+			"this passkey does not match the requested user")
+		return
+	}
+
+	if err := h.cibaRequestsT.Approve(r.Context(), authReqID, time.Now()); err != nil {
+		if errors.Is(err, domain.ErrCIBANotPending) {
+			writeError(w, h.logger, http.StatusConflict, "already_decided",
+				"this request is no longer pending")
+			return
+		}
+		if errors.Is(err, domain.ErrCIBARequestNotFound) {
+			writeError(w, h.logger, http.StatusGone, "request_expired",
+				"the underlying request has expired")
+			return
+		}
+		h.logger.Error("approve: transition ciba request", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// denyRequest is the body of POST /ciba/deny.
+type denyRequest struct {
+	Token string `json:"t"`
+}
+
+// Deny handles POST /ciba/deny. Denial does not require a passkey
+// ceremony — anyone holding the approval URL can decline (the same
+// person who could have approved). The token is consumed so a deny
+// cannot be undone, and the CIBARequest transitions to denied so the
+// polling RP gets access_denied.
+func (h *CIBAHandler) Deny(w http.ResponseWriter, r *http.Request) {
+	var req denyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_request",
+			"approval token is required")
+		return
+	}
+
+	authReqID, err := h.approvalTksC.Consume(r.Context(), req.Token)
+	if errors.Is(err, domain.ErrApprovalTokenNotFound) {
+		writeError(w, h.logger, http.StatusUnauthorized, "session_invalid",
+			"approval link expired or already used")
+		return
+	}
+	if err != nil {
+		h.logger.Error("deny: consume approval token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	if err := h.cibaRequestsT.Deny(r.Context(), authReqID, time.Now()); err != nil {
+		if errors.Is(err, domain.ErrCIBANotPending) {
+			writeError(w, h.logger, http.StatusConflict, "already_decided",
+				"this request is no longer pending")
+			return
+		}
+		if errors.Is(err, domain.ErrCIBARequestNotFound) {
+			writeError(w, h.logger, http.StatusGone, "request_expired",
+				"the underlying request has expired")
+			return
+		}
+		h.logger.Error("deny: transition ciba request", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *CIBAHandler) mapPasskeyError(w http.ResponseWriter, op string, err error) {
+	if serr, ok := errors.AsType[*passkey.ErrService](err); ok {
+		switch serr.Code {
+		case "session_invalid":
+			writeError(w, h.logger, http.StatusUnauthorized, "session_invalid", "passkey session expired")
+		case "credential_not_found", "no_credential":
+			writeError(w, h.logger, http.StatusForbidden, "user_mismatch",
+				"this passkey is not registered with the passkey service")
+		case "invalid_request", "attestation_rejected":
+			writeError(w, h.logger, http.StatusBadRequest, "invalid_request", "passkey ceremony failed")
+		default:
+			h.logger.Warn("passkey "+op, "status", serr.Status, "code", serr.Code)
+			writeError(w, h.logger, http.StatusBadGateway, "service_unavailable",
+				"passkey service returned an error")
+		}
+		return
+	}
+
+	switch {
+	case errors.Is(err, passkey.ErrServiceUnavailable),
+		errors.Is(err, passkey.ErrTransport):
+		h.logger.Error("passkey "+op, "err", err)
+		writeError(w, h.logger, http.StatusBadGateway, "service_unavailable",
+			"could not reach passkey service")
+	default:
+		h.logger.Error("passkey "+op, "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
 	}
 }
 

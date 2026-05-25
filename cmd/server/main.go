@@ -99,17 +99,21 @@ func main() {
 	})
 	userInfoHandler := handler.NewUserInfoHandler(keys, opUserStore, cfg.Issuer, logger)
 	cibaHandler := handler.NewCIBAHandler(handler.CIBAHandlerDeps{
-		Clients:              clientStore,
-		Users:                opUserStore,
-		CIBARequests:         cibaRequestStore,
-		CIBARequestsReader:   cibaRequestStore,
-		ApprovalTokens:       approvalTokenStore,
-		ApprovalTokensReader: approvalTokenStore,
-		Notifier:             authDeviceNotifier,
-		Issuer:               cfg.Issuer,
-		DefaultTTL:           cfg.CIBARequestTTL,
-		PollInterval:         5,
-		Logger:               logger,
+		Clients:                  clientStore,
+		Users:                    opUserStore,
+		UsersByPasskey:           opUserStore,
+		CIBARequests:             cibaRequestStore,
+		CIBARequestsReader:       cibaRequestStore,
+		CIBARequestsTransitioner: cibaRequestStore,
+		ApprovalTokens:           approvalTokenStore,
+		ApprovalTokensReader:     approvalTokenStore,
+		ApprovalTokensConsumer:   approvalTokenStore,
+		Passkey:                  passkeyClient,
+		Notifier:                 authDeviceNotifier,
+		Issuer:                   cfg.Issuer,
+		DefaultTTL:               cfg.CIBARequestTTL,
+		PollInterval:             5,
+		Logger:                   logger,
 	})
 
 	router := api.New(api.Deps{

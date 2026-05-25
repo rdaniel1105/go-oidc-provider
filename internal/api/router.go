@@ -70,6 +70,9 @@ func New(deps Deps) http.Handler {
 
 	r.Route("/ciba", func(r chi.Router) {
 		r.Get("/approve", deps.CIBA.Approve)
+		r.Post("/approve/login/begin", deps.CIBA.LoginBegin)
+		r.Post("/approve", deps.CIBA.ApproveSubmit)
+		r.Post("/deny", deps.CIBA.Deny)
 	})
 
 	return r

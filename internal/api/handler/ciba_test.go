@@ -20,6 +20,7 @@ import (
 	"github.com/rdaniel1105/go-oidc-provider/internal/domain"
 	"github.com/rdaniel1105/go-oidc-provider/internal/notifier"
 	"github.com/rdaniel1105/go-oidc-provider/internal/oidc"
+	"github.com/rdaniel1105/go-oidc-provider/internal/passkey"
 )
 
 // --- fakes ---
@@ -123,6 +124,68 @@ func (f *fakeApprovalTokens) Peek(_ context.Context, token string) (string, erro
 	return id, nil
 }
 
+func (f *fakeApprovalTokens) Consume(_ context.Context, token string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.bound[token]
+	if !ok {
+		return "", domain.ErrApprovalTokenNotFound
+	}
+	delete(f.bound, token)
+	return id, nil
+}
+
+// Approve flips the stored request to approved if it is currently pending.
+func (f *fakeCIBARequestIssuer) Approve(_ context.Context, authReqID string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.stored[authReqID]
+	if !ok {
+		return domain.ErrCIBARequestNotFound
+	}
+	if r.Status != domain.CIBAStatusPending {
+		return domain.ErrCIBANotPending
+	}
+	r.Status = domain.CIBAStatusApproved
+	stamp := at
+	r.ApprovedAt = &stamp
+	return nil
+}
+
+// Deny flips the stored request to denied if it is currently pending.
+func (f *fakeCIBARequestIssuer) Deny(_ context.Context, authReqID string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.stored[authReqID]
+	if !ok {
+		return domain.ErrCIBARequestNotFound
+	}
+	if r.Status != domain.CIBAStatusPending {
+		return domain.ErrCIBANotPending
+	}
+	r.Status = domain.CIBAStatusDenied
+	stamp := at
+	r.DeniedAt = &stamp
+	return nil
+}
+
+// fakeOPUsersByPasskeyID maps passkey-side user_id → op_user for the
+// post-assertion user-match check.
+type fakeOPUsersByPasskeyID struct {
+	mu          sync.Mutex
+	byPasskeyID map[uuid.UUID]*domain.OPUser
+}
+
+func (f *fakeOPUsersByPasskeyID) GetByPasskeyUserID(_ context.Context, id uuid.UUID) (*domain.OPUser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	u, ok := f.byPasskeyID[id]
+	if !ok {
+		return nil, domain.ErrOPUserNotFound
+	}
+	return u, nil
+}
+
 type fakeNotifier struct {
 	mu       sync.Mutex
 	received []notifier.Notification
@@ -142,12 +205,14 @@ func (f *fakeNotifier) Notify(_ context.Context, n notifier.Notification) error 
 // --- harness ---
 
 type cibaHarness struct {
-	clients     *fakeClients
-	users       *fakeOPUsersByEmail
-	cibaReqs    *fakeCIBARequestIssuer
-	approvalTks *fakeApprovalTokens
-	notifier    *fakeNotifier
-	handler     *CIBAHandler
+	clients        *fakeClients
+	users          *fakeOPUsersByEmail
+	usersByPasskey *fakeOPUsersByPasskeyID
+	cibaReqs       *fakeCIBARequestIssuer
+	approvalTks    *fakeApprovalTokens
+	passkey        *fakeLoginPasskey
+	notifier       *fakeNotifier
+	handler        *CIBAHandler
 }
 
 func newCIBAHarness(t *testing.T) *cibaHarness {
@@ -155,28 +220,36 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 	users := &fakeOPUsersByEmail{byEmail: map[string]*domain.OPUser{}}
+	usersByPasskey := &fakeOPUsersByPasskeyID{byPasskeyID: map[uuid.UUID]*domain.OPUser{}}
 	cibaReqs := newFakeCIBARequestIssuer()
 	approvals := newFakeApprovalTokens()
+	pk := &fakeLoginPasskey{}
 	n := &fakeNotifier{}
 
 	return &cibaHarness{
-		clients:     clients,
-		users:       users,
-		cibaReqs:    cibaReqs,
-		approvalTks: approvals,
-		notifier:    n,
+		clients:        clients,
+		users:          users,
+		usersByPasskey: usersByPasskey,
+		cibaReqs:       cibaReqs,
+		approvalTks:    approvals,
+		passkey:        pk,
+		notifier:       n,
 		handler: NewCIBAHandler(CIBAHandlerDeps{
-			Clients:              clients,
-			Users:                users,
-			CIBARequests:         cibaReqs,
-			CIBARequestsReader:   cibaReqs,
-			ApprovalTokens:       approvals,
-			ApprovalTokensReader: approvals,
-			Notifier:             n,
-			Issuer:               "http://op.local:8081",
-			DefaultTTL:           10 * time.Minute,
-			PollInterval:   5,
-			Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Clients:                  clients,
+			Users:                    users,
+			UsersByPasskey:           usersByPasskey,
+			CIBARequests:             cibaReqs,
+			CIBARequestsReader:       cibaReqs,
+			CIBARequestsTransitioner: cibaReqs,
+			ApprovalTokens:           approvals,
+			ApprovalTokensReader:     approvals,
+			ApprovalTokensConsumer:   approvals,
+			Passkey:                  pk,
+			Notifier:                 n,
+			Issuer:                   "http://op.local:8081",
+			DefaultTTL:               10 * time.Minute,
+			PollInterval:             5,
+			Logger:                   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		}),
 	}
 }
@@ -577,10 +650,266 @@ func TestApprove_PeekDoesNotConsumeOnReload(t *testing.T) {
 		IssuedAt:       now,
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		req := httptest.NewRequest(http.MethodGet, "/ciba/approve?t=tok-reload", nil)
 		rec := httptest.NewRecorder()
 		h.handler.Approve(rec, req)
 		c.Equal(http.StatusOK, rec.Code, "reload %d must still render", i+1)
 	}
+}
+
+// --- Action endpoints ---
+
+// seedApprovalReady seeds the harness with a client, an op_user with a
+// known passkey_user_id, and a pending CIBARequest + approval token.
+// Returns the values the tests need to compose requests against.
+func seedApprovalReady(t *testing.T, h *cibaHarness) (approvalToken, authReqID string, opUser *domain.OPUser, passkeyUserID uuid.UUID) {
+	t.Helper()
+
+	authReqID = "auth-req-xyz"
+	approvalToken = "tok-xyz"
+	passkeyUserID = uuid.New()
+
+	opUser = &domain.OPUser{
+		ID:            uuid.New(),
+		Email:         "alice@example.com",
+		DisplayName:   "Alice",
+		PasskeyUserID: passkeyUserID,
+	}
+	h.usersByPasskey.byPasskeyID[passkeyUserID] = opUser
+
+	h.cibaReqs.stored[authReqID] = &domain.CIBARequest{
+		ClientID:       "demo-rp",
+		OPUserID:       opUser.ID,
+		Scope:          []string{"openid", "payment"},
+		BindingMessage: "Authorize $50",
+		Status:         domain.CIBAStatusPending,
+		IssuedAt:       time.Now().UTC(),
+	}
+	h.approvalTks.bound[approvalToken] = authReqID
+
+	return approvalToken, authReqID, opUser, passkeyUserID
+}
+
+func postJSONHandler(t *testing.T, fn http.HandlerFunc, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(raw)))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	fn(rr, req)
+	return rr
+}
+
+func TestCIBALoginBegin_HappyPath(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, _, _, _ := seedApprovalReady(t, h)
+
+	h.passkey.beginResp = passkey.BeginLoginResponse{
+		Options:   json.RawMessage(`{"challenge":"abc"}`),
+		SessionID: "pk-sess-1",
+	}
+
+	rr := postJSONHandler(t, h.handler.LoginBegin, map[string]string{"t": tok})
+	c.Equal(http.StatusOK, rr.Code, "body=%s", rr.Body.String())
+
+	var resp approveLoginBeginResponse
+	c.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+	c.Equal("pk-sess-1", resp.SessionID)
+	c.JSONEq(`{"challenge":"abc"}`, string(resp.Options))
+
+	// Token is still valid for the subsequent ApproveSubmit — peek
+	// must not consume.
+	_, err := h.approvalTks.Peek(t.Context(), tok)
+	c.NoError(err)
+}
+
+func TestCIBALoginBegin_UnknownToken(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	rr := postJSONHandler(t, h.handler.LoginBegin, map[string]string{"t": "ghost"})
+	c.Equal(http.StatusUnauthorized, rr.Code)
+	c.Equal("session_invalid", decodeErrorCode(t, rr))
+	c.Equal(0, h.passkey.beginCalls, "passkey service must not be called when the token is bad")
+}
+
+func TestCIBALoginBegin_MissingToken(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	rr := postJSONHandler(t, h.handler.LoginBegin, map[string]string{})
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_request", decodeErrorCode(t, rr))
+}
+
+func TestApproveSubmit_HappyPath_TransitionsToApproved(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code, "body=%s", rr.Body.String())
+
+	// Status transitioned and approval token consumed.
+	r := h.cibaReqs.stored[authReqID]
+	c.Equal(domain.CIBAStatusApproved, r.Status)
+	c.NotNil(r.ApprovedAt)
+
+	_, err := h.approvalTks.Peek(t.Context(), tok)
+	c.ErrorIs(err, domain.ErrApprovalTokenNotFound, "token must be consumed on approve")
+}
+
+func TestApproveSubmit_UserMismatch_DoesNotTransition(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, _ := seedApprovalReady(t, h)
+
+	// Add a SECOND op_user with a different passkey id. CompleteLogin
+	// returns that other passkey user — should be rejected.
+	otherPasskeyID := uuid.New()
+	otherUser := &domain.OPUser{
+		ID:            uuid.New(),
+		Email:         "mallory@example.com",
+		DisplayName:   "Mallory",
+		PasskeyUserID: otherPasskeyID,
+	}
+	h.usersByPasskey.byPasskeyID[otherPasskeyID] = otherUser
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: otherPasskeyID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusForbidden, rr.Code)
+	c.Equal("user_mismatch", decodeErrorCode(t, rr))
+
+	r := h.cibaReqs.stored[authReqID]
+	c.Equal(domain.CIBAStatusPending, r.Status, "request must stay pending on user mismatch")
+}
+
+func TestApproveSubmit_UnknownPasskeyUser(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, _, _, _ := seedApprovalReady(t, h)
+
+	// Passkey returns a user_id that doesn't map to any op_user.
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: uuid.NewString(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusForbidden, rr.Code)
+	c.Equal("user_mismatch", decodeErrorCode(t, rr))
+}
+
+func TestApproveSubmit_AlreadyDecided(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	// Flip the request to already-approved.
+	now := time.Now().UTC()
+	h.cibaReqs.stored[authReqID].Status = domain.CIBAStatusApproved
+	h.cibaReqs.stored[authReqID].ApprovedAt = &now
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusConflict, rr.Code)
+	c.Equal("already_decided", decodeErrorCode(t, rr))
+}
+
+func TestApproveSubmit_UnknownToken(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  "ghost",
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusUnauthorized, rr.Code)
+	c.Equal("session_invalid", decodeErrorCode(t, rr))
+	c.Empty(h.passkey.completeCalls, "passkey complete must not be called when the token is bad")
+}
+
+func TestApproveSubmit_MissingFields(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, _, _, _ := seedApprovalReady(t, h)
+
+	cases := []map[string]any{
+		{"passkey_session_id": "x", "credential": json.RawMessage(`{}`)},
+		{"t": tok, "credential": json.RawMessage(`{}`)},
+		{"t": tok, "passkey_session_id": "x"},
+	}
+	for i, body := range cases {
+		rr := postJSONHandler(t, h.handler.ApproveSubmit, body)
+		c.Equalf(http.StatusBadRequest, rr.Code, "case %d", i)
+		c.Equalf("invalid_request", decodeErrorCode(t, rr), "case %d", i)
+	}
+}
+
+func TestDeny_HappyPath(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, _ := seedApprovalReady(t, h)
+
+	rr := postJSONHandler(t, h.handler.Deny, map[string]string{"t": tok})
+	c.Equal(http.StatusNoContent, rr.Code, "body=%s", rr.Body.String())
+
+	r := h.cibaReqs.stored[authReqID]
+	c.Equal(domain.CIBAStatusDenied, r.Status)
+	c.NotNil(r.DeniedAt)
+
+	_, err := h.approvalTks.Peek(t.Context(), tok)
+	c.ErrorIs(err, domain.ErrApprovalTokenNotFound, "token must be consumed on deny")
+}
+
+func TestDeny_UnknownToken(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+
+	rr := postJSONHandler(t, h.handler.Deny, map[string]string{"t": "ghost"})
+	c.Equal(http.StatusUnauthorized, rr.Code)
+	c.Equal("session_invalid", decodeErrorCode(t, rr))
+}
+
+func TestDeny_AlreadyDecided(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, _ := seedApprovalReady(t, h)
+
+	now := time.Now().UTC()
+	h.cibaReqs.stored[authReqID].Status = domain.CIBAStatusApproved
+	h.cibaReqs.stored[authReqID].ApprovedAt = &now
+
+	rr := postJSONHandler(t, h.handler.Deny, map[string]string{"t": tok})
+	c.Equal(http.StatusConflict, rr.Code)
+	c.Equal("already_decided", decodeErrorCode(t, rr))
 }
