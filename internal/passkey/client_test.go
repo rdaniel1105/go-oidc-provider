@@ -97,11 +97,12 @@ func TestClient_BeginRegister_SendsAndDecodes(t *testing.T) {
 	c.JSONEq(`{"username":"op-user-id-1","display_name":"Alice"}`, string(fake.calls[0].Body))
 }
 
-func TestClient_CompleteRegister_ReturnsCredentialID(t *testing.T) {
+func TestClient_CompleteRegister_ReturnsUserIDAndCredentialID(t *testing.T) {
 	c := require.New(t)
 	fake := newFakePasskeyService(t)
 
 	fake.on(http.MethodPost, "/api/v1/auth/register/complete", http.StatusOK, CompleteRegisterResponse{
+		UserID:       "passkey-user-uuid",
 		CredentialID: "cred-abc",
 	})
 
@@ -111,6 +112,7 @@ func TestClient_CompleteRegister_ReturnsCredentialID(t *testing.T) {
 		Credential: json.RawMessage(`{"id":"x"}`),
 	})
 	c.NoError(err)
+	c.Equal("passkey-user-uuid", resp.UserID)
 	c.Equal("cred-abc", resp.CredentialID)
 }
 

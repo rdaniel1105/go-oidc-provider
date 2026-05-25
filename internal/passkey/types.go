@@ -38,6 +38,10 @@ type CompleteRegisterRequest struct {
 // CompleteRegisterResponse is the body of a successful
 // /auth/register/complete response.
 type CompleteRegisterResponse struct {
+	// UserID is the passkey-side user identifier of the just-registered
+	// account. The OP stores this on op_users.passkey_user_id as the
+	// join key between the two services.
+	UserID string `json:"user_id"`
 	// CredentialID is the persisted credential's external identifier.
 	// Useful for audit logs; the OP does not currently key any of its own
 	// records by this value.
