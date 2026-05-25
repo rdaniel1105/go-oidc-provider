@@ -39,4 +39,22 @@ var (
 	// value here is closer to "internal error" than a user-facing
 	// condition; callers should retry with a freshly generated token.
 	ErrRefreshTokenHashTaken = errors.New("refresh token hash already taken")
+
+	// ErrAuthCodeNotFound is returned when an authorization-code lookup
+	// finds no entry (expired, never issued, or already consumed). Codes
+	// are single-use, so Consume removes the entry as a side effect.
+	ErrAuthCodeNotFound = errors.New("authorization code not found")
+
+	// ErrCIBARequestNotFound is returned when an auth_req_id lookup finds
+	// no entry (expired or never issued).
+	ErrCIBARequestNotFound = errors.New("ciba request not found")
+	// ErrCIBANotPending is returned when an approval or denial transition
+	// is attempted on a request that is already in a terminal state. The
+	// first writer wins; subsequent transitions are rejected.
+	ErrCIBANotPending = errors.New("ciba request is not pending")
+
+	// ErrApprovalTokenNotFound is returned when an approval-token lookup
+	// finds no entry (expired, never issued, or already consumed).
+	// Approval tokens are single-use.
+	ErrApprovalTokenNotFound = errors.New("approval token not found")
 )
