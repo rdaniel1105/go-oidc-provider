@@ -29,6 +29,8 @@ type Deps struct {
 	Authorize *handler.AuthorizeHandler
 	// Token serves the OAuth/OIDC token endpoint.
 	Token *handler.TokenHandler
+	// UserInfo serves the Bearer-protected OIDC userinfo endpoint.
+	UserInfo *handler.UserInfoHandler
 }
 
 // New builds the chi router. /health and /health/ready live at the root
@@ -60,6 +62,7 @@ func New(deps Deps) http.Handler {
 		r.Post("/authorize/login/begin", deps.Authorize.LoginBegin)
 		r.Post("/authorize/login/complete", deps.Authorize.LoginComplete)
 		r.Post("/token", deps.Token.Token)
+		r.Get("/userinfo", deps.UserInfo.UserInfo)
 	})
 
 	return r

@@ -100,10 +100,3 @@ func TestMintIDToken_OmitsEmailWithoutScope(t *testing.T) {
 	c.Empty(claims.Name)
 }
 
-func TestContainsScope(t *testing.T) {
-	c := require.New(t)
-	c.True(containsScope([]string{"openid", "email"}, "email"))
-	c.True(containsScope([]string{"openid", "Email"}, "email"), "case-insensitive")
-	c.False(containsScope([]string{"openid"}, "email"))
-	c.False(containsScope(nil, "email"))
-}

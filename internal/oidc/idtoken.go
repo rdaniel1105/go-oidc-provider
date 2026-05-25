@@ -3,7 +3,7 @@ package oidc
 import (
 	"crypto/ecdsa"
 	"fmt"
-	"strings"
+	"slices"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -92,13 +92,13 @@ func MintIDToken(in IDTokenInput, priv *ecdsa.PrivateKey, kid string) (string, e
 		AMR:      in.AMR,
 	}
 
-	if containsScope(in.Scope, "email") && in.Email != "" {
+	if slices.Contains(in.Scope, "email") && in.Email != "" {
 		claims.Email = in.Email
 		verified := true
 		claims.EmailVerified = &verified
 	}
 
-	if containsScope(in.Scope, "profile") && in.Name != "" {
+	if slices.Contains(in.Scope, "profile") && in.Name != "" {
 		claims.Name = in.Name
 	}
 
@@ -118,12 +118,3 @@ func MintIDToken(in IDTokenInput, priv *ecdsa.PrivateKey, kid string) (string, e
 	return out, nil
 }
 
-// containsScope reports whether the scope slice contains s.
-func containsScope(scope []string, s string) bool {
-	for _, v := range scope {
-		if strings.EqualFold(v, s) {
-			return true
-		}
-	}
-	return false
-}

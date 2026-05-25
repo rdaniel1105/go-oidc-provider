@@ -30,6 +30,9 @@ var (
 	// generates one if the directory is empty, so seeing this in normal flow
 	// means the store was constructed without the file-system bootstrap path.
 	ErrNoActiveKey = errors.New("oidc: no active signing key")
+	// ErrUnknownKID is returned by PublicKeyByKID when no loaded key
+	// matches the supplied kid. Surfaces as an invalid_token at verifiers.
+	ErrUnknownKID = errors.New("oidc: unknown kid")
 )
 
 // KeyStore holds the OP's ES256 signing material. It exposes the active
@@ -99,6 +102,18 @@ func (s *KeyStore) Active() (string, *ecdsa.PrivateKey, error) {
 	}
 
 	return "", nil, ErrNoActiveKey
+}
+
+// PublicKeyByKID returns the public key matching kid, or ErrUnknownKID if
+// no loaded key matches. Used by token verifiers to resolve the signing
+// key referenced in a JWS header.
+func (s *KeyStore) PublicKeyByKID(kid string) (*ecdsa.PublicKey, error) {
+	for _, k := range s.keys {
+		if k.kid == kid {
+			return &k.priv.PublicKey, nil
+		}
+	}
+	return nil, ErrUnknownKID
 }
 
 // PublicJWKS returns the JWKS document for the /.well-known/jwks.json

@@ -88,6 +88,7 @@ func main() {
 		RefreshTTL: cfg.RefreshTokenTTL,
 		Logger:     logger,
 	})
+	userInfoHandler := handler.NewUserInfoHandler(keys, opUserStore, cfg.Issuer, logger)
 
 	router := api.New(api.Deps{
 		Logger:    logger,
@@ -95,6 +96,7 @@ func main() {
 		User:      userHandler,
 		Authorize: authorizeHandler,
 		Token:     tokenHandler,
+		UserInfo:  userInfoHandler,
 	})
 
 	srv := &http.Server{
