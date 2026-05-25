@@ -25,6 +25,8 @@ type Deps struct {
 	Discovery *handler.DiscoveryHandler
 	// User serves the signup endpoints.
 	User *handler.UserHandler
+	// Authorize serves the auth-code flow endpoints.
+	Authorize *handler.AuthorizeHandler
 }
 
 // New builds the chi router. /health and /health/ready live at the root
@@ -49,6 +51,12 @@ func New(deps Deps) http.Handler {
 	r.Route("/users", func(r chi.Router) {
 		r.Post("/", deps.User.Begin)
 		r.Post("/complete", deps.User.Complete)
+	})
+
+	r.Route("/oidc", func(r chi.Router) {
+		r.Get("/authorize", deps.Authorize.Authorize)
+		r.Post("/authorize/login/begin", deps.Authorize.LoginBegin)
+		r.Post("/authorize/login/complete", deps.Authorize.LoginComplete)
 	})
 
 	return r

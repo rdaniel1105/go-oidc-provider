@@ -62,4 +62,9 @@ var (
 	// references a session_id for which no signup payload remains
 	// (expired, never issued, or already consumed).
 	ErrSignupStateNotFound = errors.New("signup state not found")
+
+	// ErrAuthSessionNotFound is returned when a /oidc/authorize login
+	// callback references an auth_session_id with no entry (expired,
+	// never issued, or already consumed). Auth sessions are single-use.
+	ErrAuthSessionNotFound = errors.New("auth session not found")
 )

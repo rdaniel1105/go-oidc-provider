@@ -63,18 +63,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	clientStore := pgstore.NewClientStore(pgPool)
 	opUserStore := pgstore.NewOPUserStore(pgPool)
 	signupStore := redisstore.NewSignupStateStore(redisClient, cfg.ApprovalTokenTTL)
+	authSessionStore := redisstore.NewAuthSessionStore(redisClient, cfg.ApprovalTokenTTL)
+	authCodeStore := redisstore.NewAuthCodeStore(redisClient, cfg.AuthCodeTTL)
 	passkeyClient := passkey.New(cfg.PasskeyServiceURL)
 
 	discoveryDoc := oidc.NewDiscoveryDocument(cfg.Issuer)
 	discoveryHandler := handler.NewDiscoveryHandler(keys, discoveryDoc, logger)
 	userHandler := handler.NewUserHandler(passkeyClient, signupStore, opUserStore, logger)
+	authorizeHandler := handler.NewAuthorizeHandler(
+		clientStore, opUserStore, authSessionStore, authCodeStore, passkeyClient, logger,
+	)
 
 	router := api.New(api.Deps{
 		Logger:    logger,
 		Discovery: discoveryHandler,
 		User:      userHandler,
+		Authorize: authorizeHandler,
 	})
 
 	srv := &http.Server{

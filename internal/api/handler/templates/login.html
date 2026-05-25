@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sign in</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --fg: #0f172a;
+      --muted: #64748b;
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --accent: #0f766e;
+      --danger: #dc2626;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      margin: 0; padding: 4rem 1rem;
+      background: var(--bg); color: var(--fg);
+      max-width: 480px; margin-inline: auto;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 0.25rem; }
+    p.lead { margin: 0 0 1.5rem; color: var(--muted); font-size: 0.95rem; }
+    p.client { margin: 0 0 1.5rem; font-size: 0.85rem; color: var(--muted); }
+    p.client code { background: #f1f5f9; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    button {
+      width: 100%;
+      appearance: none;
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.95rem;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status { margin-top: 1rem; font-size: 0.85rem; color: var(--muted); min-height: 1.2em; }
+    .status.error { color: var(--danger); }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Sign in with your passkey</h1>
+    <p class="lead">Use the passkey you registered with this account to continue.</p>
+    <p class="client">Continuing to <code>{{.ClientID}}</code></p>
+
+    <button id="signin">Sign in with passkey</button>
+    <p id="status" class="status" role="status"></p>
+  </main>
+
+  <script>
+    "use strict";
+
+    const authSessionID = {{.AuthSessionID | js}};
+
+    function b64uToBuf(str) {
+      const pad = "=".repeat((4 - (str.length % 4)) % 4);
+      const std = (str + pad).replace(/-/g, "+").replace(/_/g, "/");
+      const bin = atob(std);
+      const buf = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+      return buf.buffer;
+    }
+
+    function bufToB64u(buf) {
+      const bytes = new Uint8Array(buf);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function prepRequestOptions(options) {
+      const o = { ...options };
+      o.challenge = b64uToBuf(options.challenge);
+      if (options.allowCredentials) {
+        o.allowCredentials = options.allowCredentials.map(c => ({ ...c, id: b64uToBuf(c.id) }));
+      }
+      return o;
+    }
+
+    function assertionToWire(cred) {
+      return {
+        id: cred.id,
+        rawId: bufToB64u(cred.rawId),
+        type: cred.type,
+        response: {
+          clientDataJSON:    bufToB64u(cred.response.clientDataJSON),
+          authenticatorData: bufToB64u(cred.response.authenticatorData),
+          signature:         bufToB64u(cred.response.signature),
+          userHandle:        cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null,
+        },
+      };
+    }
+
+    async function api(path, body) {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      const text = await res.text();
+      let parsed = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch (_) { /* keep null */ }
+      return { ok: res.ok, status: res.status, body: parsed };
+    }
+
+    function setStatus(msg, isError) {
+      const el = document.getElementById("status");
+      el.textContent = msg || "";
+      el.classList.toggle("error", !!isError);
+    }
+
+    document.getElementById("signin").addEventListener("click", async () => {
+      const btn = document.getElementById("signin");
+      btn.disabled = true;
+      setStatus("Waiting for passkey…");
+
+      try {
+        const begin = await api("/oidc/authorize/login/begin", {});
+        if (!begin.ok) {
+          setStatus(begin.body && begin.body.error_description || "Could not start sign-in.", true);
+          btn.disabled = false;
+          return;
+        }
+
+        const cred = await navigator.credentials.get({
+          publicKey: prepRequestOptions(begin.body.options),
+        });
+        if (!cred) {
+          setStatus("The passkey prompt was cancelled.", true);
+          btn.disabled = false;
+          return;
+        }
+
+        const complete = await api("/oidc/authorize/login/complete", {
+          auth_session_id:    authSessionID,
+          passkey_session_id: begin.body.session_id,
+          credential:         assertionToWire(cred),
+        });
+        if (!complete.ok || !complete.body || !complete.body.redirect_url) {
+          setStatus(complete.body && complete.body.error_description || "Sign-in failed.", true);
+          btn.disabled = false;
+          return;
+        }
+
+        window.location.href = complete.body.redirect_url;
+      } catch (e) {
+        setStatus(e && e.message ? e.message : String(e), true);
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
