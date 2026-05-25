@@ -24,3 +24,4 @@ coverage.html
 # Design docs (not part of the repo)
 oidc_provider_prd.md
 truora_wallet_ciba_integration.md
+RUNNING.md
