@@ -187,6 +187,7 @@ func Load() (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		*t.target = d
 	}
 
@@ -224,25 +225,31 @@ func (c *Config) validateNotifier() error {
 		if c.TelegramBotToken == "" {
 			return ErrMissingTelegramBotToken
 		}
+
 		if c.TelegramDefaultChatID == "" {
 			return ErrMissingTelegramChatID
 		}
+
 		return nil
 	case NotifierWhatsApp:
 		if c.WhatsAppPhoneNumberID == "" {
 			return ErrMissingWhatsAppPhoneID
 		}
+
 		if c.WhatsAppAccessToken == "" {
 			return ErrMissingWhatsAppToken
 		}
+
 		if c.WhatsAppTemplateName == "" {
 			return ErrMissingWhatsAppTemplate
 		}
+
 		return nil
 	case NotifierWebhook:
 		if c.WebhookURL == "" {
 			return ErrMissingWebhookURL
 		}
+
 		return nil
 	default:
 		return ErrUnknownNotifier
