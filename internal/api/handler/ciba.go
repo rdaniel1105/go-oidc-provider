@@ -73,6 +73,14 @@ type opUserByPasskeyIDLookup interface {
 	GetByPasskeyUserID(ctx context.Context, passkeyUserID uuid.UUID) (*domain.OPUser, error)
 }
 
+// cibaCallbackClient captures the OP→RP callback used in ping (and
+// later push) delivery modes. The handler calls it best-effort after a
+// terminal transition; a failure here is logged but does not roll back
+// the approval / denial.
+type cibaCallbackClient interface {
+	Ping(ctx context.Context, endpoint, clientNotificationToken, authReqID string) error
+}
+
 // CIBAHandler implements POST /oidc/bc-authorize. The flow:
 //  1. authenticate the client
 //  2. validate the request against the registered client
@@ -96,9 +104,11 @@ type CIBAHandler struct {
 	approvalTksC    approvalTokenConsumer
 	passkey         passkeyLoginClient
 	notifier        notifier.AuthDeviceNotifier
+	callback        cibaCallbackClient
 	issuer          string
 	defaultTTL      time.Duration
 	pollInterval    int
+	callbackTimeout time.Duration
 	logger          *slog.Logger
 }
 
@@ -134,6 +144,11 @@ type CIBAHandlerDeps struct {
 	Passkey passkeyLoginClient
 	// Notifier delivers the approval URL to the user's device.
 	Notifier notifier.AuthDeviceNotifier
+	// Callback POSTs the RP's client_notification_endpoint after a
+	// terminal CIBA transition for ping- and push-mode clients. May be
+	// nil — in that case the OP behaves as if every client were
+	// configured for poll delivery.
+	Callback cibaCallbackClient
 	// Issuer is the OP issuer URL — the approval URL is built off it.
 	Issuer string
 	// DefaultTTL is the CIBA request TTL used when the RP does not send
@@ -142,28 +157,83 @@ type CIBAHandlerDeps struct {
 	// PollInterval is the seconds value the OP returns in the response
 	// so polling clients know how often to hit the token endpoint.
 	PollInterval int
+	// CallbackTimeout caps how long the OP waits on the RP's
+	// notification endpoint. Defaults to 5 seconds when zero.
+	CallbackTimeout time.Duration
 	// Logger receives one structured line per failure that warrants it.
 	Logger *slog.Logger
 }
 
 // NewCIBAHandler returns a CIBAHandler from its dependencies.
 func NewCIBAHandler(deps CIBAHandlerDeps) *CIBAHandler {
+	timeout := deps.CallbackTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	return &CIBAHandler{
-		clients:        deps.Clients,
-		users:          deps.Users,
-		usersByPasskey: deps.UsersByPasskey,
-		cibaRequests:   deps.CIBARequests,
-		cibaRequestsR:  deps.CIBARequestsReader,
-		cibaRequestsT:  deps.CIBARequestsTransitioner,
-		approvalTks:    deps.ApprovalTokens,
-		approvalTksR:   deps.ApprovalTokensReader,
-		approvalTksC:   deps.ApprovalTokensConsumer,
-		passkey:        deps.Passkey,
-		notifier:       deps.Notifier,
-		issuer:         deps.Issuer,
-		defaultTTL:     deps.DefaultTTL,
-		pollInterval:   deps.PollInterval,
-		logger:         deps.Logger,
+		clients:         deps.Clients,
+		users:           deps.Users,
+		usersByPasskey:  deps.UsersByPasskey,
+		cibaRequests:    deps.CIBARequests,
+		cibaRequestsR:   deps.CIBARequestsReader,
+		cibaRequestsT:   deps.CIBARequestsTransitioner,
+		approvalTks:     deps.ApprovalTokens,
+		approvalTksR:    deps.ApprovalTokensReader,
+		approvalTksC:    deps.ApprovalTokensConsumer,
+		passkey:         deps.Passkey,
+		notifier:        deps.Notifier,
+		callback:        deps.Callback,
+		issuer:          deps.Issuer,
+		defaultTTL:      deps.DefaultTTL,
+		pollInterval:    deps.PollInterval,
+		callbackTimeout: timeout,
+		logger:          deps.Logger,
+	}
+}
+
+// notifyClient runs the OP→RP callback for ping- and push-mode clients
+// after a terminal transition. The call is detached from the user's
+// request context (so closing the browser does not cancel the ping)
+// with its own short timeout. Failures are logged but do not roll back
+// the OP-side state: ping clients can still poll /oidc/token, and the
+// CIBARequest stays in its terminal state regardless.
+func (h *CIBAHandler) notifyClient(authReqID string, req *domain.CIBARequest) {
+	if h.callback == nil || req.ClientNotificationToken == "" {
+		return
+	}
+
+	client, err := h.clients.GetByClientID(context.Background(), req.ClientID)
+	if err != nil {
+		h.logger.Error("ciba callback: lookup client", "err", err, "client_id", req.ClientID)
+		return
+	}
+
+	if client.BackchannelTokenDeliveryMode == nil {
+		return
+	}
+	if *client.BackchannelTokenDeliveryMode != domain.CIBADeliveryPing &&
+		*client.BackchannelTokenDeliveryMode != domain.CIBADeliveryPush {
+		// poll clients are not notified — the RP polls /oidc/token.
+		return
+	}
+	if client.ClientNotificationEndpoint == nil || *client.ClientNotificationEndpoint == "" {
+		h.logger.Warn("ciba callback: client has delivery mode but no endpoint",
+			"client_id", client.ClientID, "mode", *client.BackchannelTokenDeliveryMode)
+		return
+	}
+
+	// Push-mode bodies (tokens) land in phase 20. For now the body is
+	// the same ping shape — push clients fall back to polling /token,
+	// which still works.
+	ctx, cancel := context.WithTimeout(context.Background(), h.callbackTimeout)
+	defer cancel()
+
+	if err := h.callback.Ping(ctx, *client.ClientNotificationEndpoint, req.ClientNotificationToken, authReqID); err != nil {
+		h.logger.Error("ciba callback ping",
+			"err", err,
+			"client_id", client.ClientID,
+			"endpoint", *client.ClientNotificationEndpoint,
+		)
 	}
 }
 
@@ -333,6 +403,8 @@ func (h *CIBAHandler) ApproveSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.notifyClient(authReqID, cibaReq)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -380,6 +452,10 @@ func (h *CIBAHandler) Deny(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("deny: transition ciba request", "err", err)
 		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
 		return
+	}
+
+	if cibaReq, err := h.cibaRequestsR.Get(r.Context(), authReqID); err == nil {
+		h.notifyClient(authReqID, cibaReq)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

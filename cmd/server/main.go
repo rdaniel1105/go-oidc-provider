@@ -19,6 +19,7 @@ import (
 
 	"github.com/rdaniel1105/go-oidc-provider/internal/api"
 	"github.com/rdaniel1105/go-oidc-provider/internal/api/handler"
+	"github.com/rdaniel1105/go-oidc-provider/internal/ciba"
 	"github.com/rdaniel1105/go-oidc-provider/internal/config"
 	"github.com/rdaniel1105/go-oidc-provider/internal/notifier"
 	"github.com/rdaniel1105/go-oidc-provider/internal/oidc"
@@ -100,6 +101,8 @@ func main() {
 		Logger:       logger,
 	})
 	userInfoHandler := handler.NewUserInfoHandler(keys, opUserStore, cfg.Issuer, logger)
+	cibaCallbackClient := ciba.NewCallbackClient()
+
 	cibaHandler := handler.NewCIBAHandler(handler.CIBAHandlerDeps{
 		Clients:                  clientStore,
 		Users:                    opUserStore,
@@ -112,6 +115,7 @@ func main() {
 		ApprovalTokensConsumer:   approvalTokenStore,
 		Passkey:                  passkeyClient,
 		Notifier:                 authDeviceNotifier,
+		Callback:                 cibaCallbackClient,
 		Issuer:                   cfg.Issuer,
 		DefaultTTL:               cfg.CIBARequestTTL,
 		PollInterval:             5,

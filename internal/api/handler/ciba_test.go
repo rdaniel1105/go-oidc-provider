@@ -169,6 +169,31 @@ func (f *fakeCIBARequestIssuer) Deny(_ context.Context, authReqID string, at tim
 	return nil
 }
 
+// fakeCIBACallback records callbacks the handler initiates to RP
+// notification endpoints.
+type fakeCIBACallback struct {
+	mu    sync.Mutex
+	calls []fakeCIBACallbackCall
+	err   error
+}
+
+type fakeCIBACallbackCall struct {
+	Endpoint                string
+	ClientNotificationToken string
+	AuthReqID               string
+}
+
+func (f *fakeCIBACallback) Ping(_ context.Context, endpoint, clientNotificationToken, authReqID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fakeCIBACallbackCall{
+		Endpoint:                endpoint,
+		ClientNotificationToken: clientNotificationToken,
+		AuthReqID:               authReqID,
+	})
+	return f.err
+}
+
 // fakeOPUsersByPasskeyID maps passkey-side user_id → op_user for the
 // post-assertion user-match check.
 type fakeOPUsersByPasskeyID struct {
@@ -212,6 +237,7 @@ type cibaHarness struct {
 	approvalTks    *fakeApprovalTokens
 	passkey        *fakeLoginPasskey
 	notifier       *fakeNotifier
+	callback       *fakeCIBACallback
 	handler        *CIBAHandler
 }
 
@@ -225,6 +251,7 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 	approvals := newFakeApprovalTokens()
 	pk := &fakeLoginPasskey{}
 	n := &fakeNotifier{}
+	cb := &fakeCIBACallback{}
 
 	return &cibaHarness{
 		clients:        clients,
@@ -234,6 +261,7 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 		approvalTks:    approvals,
 		passkey:        pk,
 		notifier:       n,
+		callback:       cb,
 		handler: NewCIBAHandler(CIBAHandlerDeps{
 			Clients:                  clients,
 			Users:                    users,
@@ -246,6 +274,7 @@ func newCIBAHarness(t *testing.T) *cibaHarness {
 			ApprovalTokensConsumer:   approvals,
 			Passkey:                  pk,
 			Notifier:                 n,
+			Callback:                 cb,
 			Issuer:                   "http://op.local:8081",
 			DefaultTTL:               10 * time.Minute,
 			PollInterval:             5,
@@ -912,4 +941,138 @@ func TestDeny_AlreadyDecided(t *testing.T) {
 	rr := postJSONHandler(t, h.handler.Deny, map[string]string{"t": tok})
 	c.Equal(http.StatusConflict, rr.Code)
 	c.Equal("already_decided", decodeErrorCode(t, rr))
+}
+
+// --- Ping mode callback ---
+
+func setClientPingMode(t *testing.T, h *cibaHarness, endpoint string) {
+	t.Helper()
+	mode := domain.CIBADeliveryPing
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ID:                      uuid.New(),
+		ClientID:                "demo-rp",
+		ClientSecretHash:        bcryptHash(t, "super-secret"),
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		Scopes:                  []string{"openid", "payment"},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+		BackchannelTokenDeliveryMode: &mode,
+		ClientNotificationEndpoint:   &endpoint,
+	}
+}
+
+func TestApproveSubmit_PingClient_FiresCallback(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	setClientPingMode(t, h, "https://rp.example.com/notify")
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code)
+
+	c.Len(h.callback.calls, 1)
+	got := h.callback.calls[0]
+	c.Equal("https://rp.example.com/notify", got.Endpoint)
+	c.Equal("rp-correlation-id", got.ClientNotificationToken)
+	c.Equal(authReqID, got.AuthReqID)
+}
+
+func TestDeny_PingClient_FiresCallback(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, _ := seedApprovalReady(t, h)
+
+	setClientPingMode(t, h, "https://rp.example.com/notify")
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+
+	rr := postJSONHandler(t, h.handler.Deny, map[string]string{"t": tok})
+	c.Equal(http.StatusNoContent, rr.Code)
+
+	c.Len(h.callback.calls, 1)
+	c.Equal(authReqID, h.callback.calls[0].AuthReqID)
+}
+
+func TestApproveSubmit_PollClient_DoesNotFireCallback(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, _, _, passkeyUserID := seedApprovalReady(t, h)
+
+	// Default seeded client has no delivery mode set — treat as poll.
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ClientID:                "demo-rp",
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+	}
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code)
+	c.Empty(h.callback.calls, "poll clients must not be notified")
+}
+
+func TestApproveSubmit_PingFailureDoesNotRollBack(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	setClientPingMode(t, h, "https://rp.example.com/notify")
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+	h.callback.err = errors.New("RP is down")
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code,
+		"a ping failure must not change the user-facing response — the RP can still poll")
+	c.Equal(domain.CIBAStatusApproved, h.cibaReqs.stored[authReqID].Status)
+}
+
+func TestApproveSubmit_PingClient_WithoutEndpoint_SilentlySkipped(t *testing.T) {
+	c := require.New(t)
+	h := newCIBAHarness(t)
+	tok, authReqID, _, passkeyUserID := seedApprovalReady(t, h)
+
+	mode := domain.CIBADeliveryPing
+	h.clients.byClientID["demo-rp"] = &domain.Client{
+		ClientID:                "demo-rp",
+		GrantTypes:              []string{oidc.CIBAGrantType},
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+		BackchannelTokenDeliveryMode: &mode,
+		// no ClientNotificationEndpoint
+	}
+	h.cibaReqs.stored[authReqID].ClientNotificationToken = "rp-correlation-id"
+
+	h.passkey.completeResp = passkey.CompleteLoginResponse{
+		UserID: passkeyUserID.String(),
+	}
+
+	rr := postJSONHandler(t, h.handler.ApproveSubmit, map[string]any{
+		"t":                  tok,
+		"passkey_session_id": "pk-sess-1",
+		"credential":         json.RawMessage(`{"id":"x"}`),
+	})
+	c.Equal(http.StatusNoContent, rr.Code)
+	c.Empty(h.callback.calls)
 }
