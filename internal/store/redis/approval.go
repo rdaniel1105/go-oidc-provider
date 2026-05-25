@@ -52,6 +52,7 @@ func (s *ApprovalTokenStore) Consume(ctx context.Context, token string) (string,
 	if errors.Is(err, redis.Nil) {
 		return "", domain.ErrApprovalTokenNotFound
 	}
+
 	if err != nil {
 		return "", fmt.Errorf("getdel approval token: %w", err)
 	}
