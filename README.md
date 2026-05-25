@@ -9,9 +9,9 @@ A Go OpenID Provider that ships the parts most reference impls hand-wave: a full
 | Phase | Status |
 |---|---|
 | 1. Scaffold | ✅ |
-| 2. Config package | ⏳ |
-| 3. Signing keys + JWKS | ⏳ |
-| 4. Discovery endpoint | ⏳ |
+| 2. Config package | ✅ |
+| 3. Signing keys + JWKS | ✅ |
+| 4. Discovery endpoint | ✅ |
 | 5. Postgres stores | ⏳ |
 | 6. Redis stores | ⏳ |
 | 7. go-passkey-auth HTTP client | ⏳ |
