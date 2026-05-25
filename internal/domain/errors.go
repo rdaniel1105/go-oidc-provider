@@ -14,4 +14,17 @@ var (
 	// ErrClientIDTaken is returned when registering a client whose client_id
 	// already exists among live (non-deleted) rows.
 	ErrClientIDTaken = errors.New("client_id already taken")
+
+	// ErrOPUserNotFound is returned when an op_user lookup finds no live row.
+	ErrOPUserNotFound = errors.New("op_user not found")
+	// ErrEmailTaken is returned when creating an op_user whose email already
+	// exists among live rows.
+	ErrEmailTaken = errors.New("email already taken")
+	// ErrPhoneTaken is returned when creating an op_user whose phone_e164
+	// already exists among live rows.
+	ErrPhoneTaken = errors.New("phone already taken")
+	// ErrPasskeyUserIDTaken is returned when creating an op_user whose
+	// passkey_user_id is already linked to another live op_user. The
+	// passkey service's user is meant to map to exactly one OP identity.
+	ErrPasskeyUserIDTaken = errors.New("passkey_user_id already linked")
 )
