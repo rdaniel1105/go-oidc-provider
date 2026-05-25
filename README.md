@@ -21,7 +21,7 @@ A Go OpenID Provider that ships the parts most reference impls hand-wave: a full
 | 11. UserInfo | ✅ |
 | 12. Refresh token rotation | ✅ |
 | 13. AuthDeviceNotifier interface | ✅ |
-| 14. Telegram + WhatsApp notifiers | ⏳ |
+| 14. Telegram + WhatsApp notifiers | 🚧 telegram only |
 | 15–20. CIBA (bc-authorize, approve, poll/ping/push) | ⏳ |
 | 21. Health + request logger | ⏳ |
 | 22. testcontainers integration tests | ⏳ |

@@ -35,12 +35,23 @@ func TestBuild_Webhook(t *testing.T) {
 	c.True(ok)
 }
 
-func TestBuild_UnimplementedChannels(t *testing.T) {
+func TestBuild_Telegram(t *testing.T) {
 	c := require.New(t)
-	for _, kind := range []config.NotifierKind{config.NotifierTelegram, config.NotifierWhatsApp} {
-		_, err := Build(&config.Config{Notifier: kind}, discardLogger())
-		c.Error(err, "%s should fail until its implementation lands", kind)
-	}
+	n, err := Build(&config.Config{
+		Notifier:              config.NotifierTelegram,
+		TelegramBotToken:      "abc:123",
+		TelegramDefaultChatID: "555",
+	}, discardLogger())
+	c.NoError(err)
+
+	_, ok := n.(*TelegramNotifier)
+	c.True(ok)
+}
+
+func TestBuild_WhatsAppUnimplemented(t *testing.T) {
+	c := require.New(t)
+	_, err := Build(&config.Config{Notifier: config.NotifierWhatsApp}, discardLogger())
+	c.Error(err, "whatsapp should fail until its implementation lands")
 }
 
 func TestBuild_Unknown(t *testing.T) {
