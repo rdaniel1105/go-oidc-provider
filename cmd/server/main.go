@@ -20,6 +20,7 @@ import (
 	"github.com/rdaniel1105/go-oidc-provider/internal/api"
 	"github.com/rdaniel1105/go-oidc-provider/internal/api/handler"
 	"github.com/rdaniel1105/go-oidc-provider/internal/config"
+	"github.com/rdaniel1105/go-oidc-provider/internal/notifier"
 	"github.com/rdaniel1105/go-oidc-provider/internal/oidc"
 	"github.com/rdaniel1105/go-oidc-provider/internal/passkey"
 	pgstore "github.com/rdaniel1105/go-oidc-provider/internal/store/postgres"
@@ -69,7 +70,15 @@ func main() {
 	signupStore := redisstore.NewSignupStateStore(redisClient, cfg.ApprovalTokenTTL)
 	authSessionStore := redisstore.NewAuthSessionStore(redisClient, cfg.ApprovalTokenTTL)
 	authCodeStore := redisstore.NewAuthCodeStore(redisClient, cfg.AuthCodeTTL)
+	cibaRequestStore := redisstore.NewCIBARequestStore(redisClient)
+	approvalTokenStore := redisstore.NewApprovalTokenStore(redisClient, cfg.ApprovalTokenTTL)
 	passkeyClient := passkey.New(cfg.PasskeyServiceURL)
+
+	authDeviceNotifier, err := notifier.Build(cfg, logger)
+	if err != nil {
+		logger.Error("notifier build failed", "err", err)
+		os.Exit(1)
+	}
 
 	discoveryDoc := oidc.NewDiscoveryDocument(cfg.Issuer)
 	discoveryHandler := handler.NewDiscoveryHandler(keys, discoveryDoc, logger)
@@ -89,6 +98,17 @@ func main() {
 		Logger:     logger,
 	})
 	userInfoHandler := handler.NewUserInfoHandler(keys, opUserStore, cfg.Issuer, logger)
+	cibaHandler := handler.NewCIBAHandler(handler.CIBAHandlerDeps{
+		Clients:        clientStore,
+		Users:          opUserStore,
+		CIBARequests:   cibaRequestStore,
+		ApprovalTokens: approvalTokenStore,
+		Notifier:       authDeviceNotifier,
+		Issuer:         cfg.Issuer,
+		DefaultTTL:     cfg.CIBARequestTTL,
+		PollInterval:   5,
+		Logger:         logger,
+	})
 
 	router := api.New(api.Deps{
 		Logger:    logger,
@@ -97,6 +117,7 @@ func main() {
 		Authorize: authorizeHandler,
 		Token:     tokenHandler,
 		UserInfo:  userInfoHandler,
+		CIBA:      cibaHandler,
 	})
 
 	srv := &http.Server{

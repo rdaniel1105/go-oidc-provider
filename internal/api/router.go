@@ -31,6 +31,8 @@ type Deps struct {
 	Token *handler.TokenHandler
 	// UserInfo serves the Bearer-protected OIDC userinfo endpoint.
 	UserInfo *handler.UserInfoHandler
+	// CIBA serves the backchannel-authentication endpoint.
+	CIBA *handler.CIBAHandler
 }
 
 // New builds the chi router. /health and /health/ready live at the root
@@ -63,6 +65,7 @@ func New(deps Deps) http.Handler {
 		r.Post("/authorize/login/complete", deps.Authorize.LoginComplete)
 		r.Post("/token", deps.Token.Token)
 		r.Get("/userinfo", deps.UserInfo.UserInfo)
+		r.Post("/bc-authorize", deps.CIBA.BCAuthorize)
 	})
 
 	return r
