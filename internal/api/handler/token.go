@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,11 +22,14 @@ type authCodeConsumer interface {
 	Consume(ctx context.Context, code string) (*domain.AuthCode, error)
 }
 
-// refreshTokenCreator captures the persistence side of the refresh-token
-// store. Rotation (lookup + revoke + family-wide takedown) lands alongside
-// the refresh-token grant in a later phase.
-type refreshTokenCreator interface {
+// refreshTokenStore captures the full lifecycle the token endpoint needs:
+// issuance at auth-code grant, lookup-by-hash + revocation at rotation,
+// and family-wide takedown when a stolen token is replayed.
+type refreshTokenStore interface {
 	Create(ctx context.Context, t *domain.RefreshToken) (*domain.RefreshToken, error)
+	GetByHash(ctx context.Context, hash string) (*domain.RefreshToken, error)
+	Revoke(ctx context.Context, id uuid.UUID, at time.Time) error
+	RevokeFamily(ctx context.Context, familyID uuid.UUID, at time.Time) (int64, error)
 }
 
 // opUserByID captures the op_user store's GetByID path used to fetch the
@@ -47,7 +51,7 @@ type TokenHandler struct {
 	clients    oidc.ClientLookup
 	authCodes  authCodeConsumer
 	users      opUserByID
-	refresh    refreshTokenCreator
+	refresh    refreshTokenStore
 	keys       activeKeySource
 	issuer     string
 	accessTTL  time.Duration
@@ -65,7 +69,7 @@ type TokenHandlerDeps struct {
 	// Users fetches the subject op_user by id.
 	Users opUserByID
 	// Refresh persists newly issued refresh-token rows.
-	Refresh refreshTokenCreator
+	Refresh refreshTokenStore
 	// Keys provides the active ES256 signing key + kid for token signing.
 	Keys activeKeySource
 	// Issuer is the OP issuer URL, copied verbatim into iss / aud claims.
@@ -122,6 +126,8 @@ func (h *TokenHandler) Token(w http.ResponseWriter, r *http.Request) {
 	switch grant {
 	case "authorization_code":
 		h.handleAuthorizationCode(w, r, client)
+	case "refresh_token":
+		h.handleRefreshToken(w, r, client)
 	default:
 		writeError(w, h.logger, http.StatusBadRequest, "unsupported_grant_type",
 			"grant_type "+grant+" is not supported at this endpoint")
@@ -242,7 +248,9 @@ func (h *TokenHandler) handleAuthorizationCode(w http.ResponseWriter, r *http.Re
 		TokenHash: refreshHash,
 		ClientID:  client.ClientID,
 		OPUserID:  user.ID,
+		FamilyID:  uuid.New(),
 		Scope:     authCode.Scope,
+		AuthTime:  authCode.IssuedAt,
 		ExpiresAt: now.Add(h.refreshTTL),
 	}); err != nil {
 		h.logger.Error("token: persist refresh token", "err", err)
@@ -258,6 +266,178 @@ func (h *TokenHandler) handleAuthorizationCode(w http.ResponseWriter, r *http.Re
 		ExpiresIn:    int(h.accessTTL.Seconds()),
 		Scope:        strings.Join(authCode.Scope, " "),
 	})
+}
+
+func (h *TokenHandler) handleRefreshToken(w http.ResponseWriter, r *http.Request, client *domain.Client) {
+	raw := r.PostForm.Get("refresh_token")
+	if raw == "" {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_request",
+			"refresh_token is required")
+		return
+	}
+
+	presented, err := h.refresh.GetByHash(r.Context(), oidc.HashRefreshToken(raw))
+	if errors.Is(err, domain.ErrRefreshTokenNotFound) {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"refresh_token is unknown")
+		return
+	}
+	if err != nil {
+		h.logger.Error("token: lookup refresh token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	if presented.ClientID != client.ClientID {
+		// Mismatched client — treat as theft signal and burn the family.
+		// The legitimate holder will have to re-authenticate.
+		if _, revErr := h.refresh.RevokeFamily(r.Context(), presented.FamilyID, nowUTC()); revErr != nil {
+			h.logger.Error("token: revoke family on client mismatch", "err", revErr)
+		}
+		h.logger.Warn("token: refresh client mismatch", "presented_client", client.ClientID, "row_client", presented.ClientID)
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"refresh_token was issued to a different client")
+		return
+	}
+
+	if presented.IsRevoked() {
+		// Replay of an already-revoked token. The legitimate user holds
+		// some descendant of this family by now; revoke the whole chain
+		// to force a fresh authentication.
+		if _, revErr := h.refresh.RevokeFamily(r.Context(), presented.FamilyID, nowUTC()); revErr != nil {
+			h.logger.Error("token: revoke family on replay", "err", revErr)
+		}
+		h.logger.Warn("token: refresh replay detected", "family_id", presented.FamilyID)
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"refresh_token has been revoked")
+		return
+	}
+
+	now := nowUTC()
+	if presented.IsExpired(now) {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"refresh_token is expired")
+		return
+	}
+
+	scope, err := narrowRefreshScope(presented.Scope, r.PostForm.Get("scope"))
+	if err != nil {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_scope", err.Error())
+		return
+	}
+
+	if err := h.refresh.Revoke(r.Context(), presented.ID, now); err != nil {
+		h.logger.Error("token: revoke rotated refresh", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	user, err := h.users.GetByID(r.Context(), presented.OPUserID)
+	if errors.Is(err, domain.ErrOPUserNotFound) {
+		writeError(w, h.logger, http.StatusBadRequest, "invalid_grant",
+			"the user backing this refresh_token no longer exists")
+		return
+	}
+	if err != nil {
+		h.logger.Error("token: lookup op_user", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	kid, priv, err := h.keys.Active()
+	if err != nil {
+		h.logger.Error("token: active key", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	accessExpiry := now.Add(h.accessTTL)
+
+	accessToken, err := oidc.MintAccessToken(oidc.AccessTokenInput{
+		Issuer:    h.issuer,
+		SubjectID: user.ID.String(),
+		ClientID:  client.ClientID,
+		IssuedAt:  now,
+		Expiry:    accessExpiry,
+		Scope:     scope,
+	}, priv, kid)
+	if err != nil {
+		h.logger.Error("token: mint access token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	// ID token at refresh: omit nonce (the original nonce only binds the
+	// initial auth-code response). auth_time carries through from the
+	// row so the RP still sees when the user really authenticated, not
+	// when they last refreshed.
+	idToken, err := oidc.MintIDToken(oidc.IDTokenInput{
+		Issuer:    h.issuer,
+		SubjectID: user.ID.String(),
+		Audience:  client.ClientID,
+		IssuedAt:  now,
+		Expiry:    accessExpiry,
+		AuthTime:  presented.AuthTime,
+		ACR:       "urn:passkey",
+		AMR:       []string{"webauthn", "user"},
+		Scope:     scope,
+		Email:     user.Email,
+		Name:      user.DisplayName,
+	}, priv, kid)
+	if err != nil {
+		h.logger.Error("token: mint id token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	newRaw, newHash, err := oidc.NewRefreshToken()
+	if err != nil {
+		h.logger.Error("token: new refresh token", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	if _, err := h.refresh.Create(r.Context(), &domain.RefreshToken{
+		TokenHash: newHash,
+		ClientID:  client.ClientID,
+		OPUserID:  user.ID,
+		FamilyID:  presented.FamilyID,
+		Scope:     scope,
+		AuthTime:  presented.AuthTime,
+		ExpiresAt: now.Add(h.refreshTTL),
+	}); err != nil {
+		h.logger.Error("token: persist rotated refresh", "err", err)
+		writeError(w, h.logger, http.StatusInternalServerError, "server_error", "")
+		return
+	}
+
+	writeJSON(w, h.logger, http.StatusOK, tokenResponse{
+		AccessToken:  accessToken,
+		IDToken:      idToken,
+		RefreshToken: newRaw,
+		TokenType:    "Bearer",
+		ExpiresIn:    int(h.accessTTL.Seconds()),
+		Scope:        strings.Join(scope, " "),
+	})
+}
+
+// narrowRefreshScope enforces that any RP-requested scope at the refresh
+// endpoint is a (non-strict) subset of the scope already granted on the
+// original code. Widening is rejected. Empty input means "keep the
+// original scope".
+func narrowRefreshScope(granted []string, requested string) ([]string, error) {
+	parts := splitSpaceList(requested)
+	if len(parts) == 0 {
+		return granted, nil
+	}
+
+	for _, p := range parts {
+		if !slices.Contains(granted, p) {
+			return nil, errors.New("scope " + p + " was not part of the original grant")
+		}
+	}
+
+	return parts, nil
 }
 
 func (h *TokenHandler) writeClientAuthError(w http.ResponseWriter, err error) {

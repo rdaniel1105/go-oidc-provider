@@ -150,6 +150,76 @@ func TestRefreshTokenStore_Revoke_UnknownIDIsNotFound(t *testing.T) {
 	c.ErrorIs(err, domain.ErrRefreshTokenNotFound)
 }
 
+func TestRefreshTokenStore_Create_GeneratesFamilyIDWhenZero(t *testing.T) {
+	c := require.New(t)
+	resetDB(t, "refresh_tokens", "op_users")
+
+	ctx := context.Background()
+	user := createTestOPUser(t, ctx)
+	store := NewRefreshTokenStore(testPool)
+
+	in := sampleRefreshToken(user.ID, "no-family")
+	c.Equal(uuid.Nil, in.FamilyID)
+
+	got, err := store.Create(ctx, in)
+	c.NoError(err)
+	c.NotEqual(uuid.Nil, got.FamilyID, "store must allocate a family id for the first token in a chain")
+}
+
+func TestRefreshTokenStore_Create_PreservesExplicitFamilyID(t *testing.T) {
+	c := require.New(t)
+	resetDB(t, "refresh_tokens", "op_users")
+
+	ctx := context.Background()
+	user := createTestOPUser(t, ctx)
+	store := NewRefreshTokenStore(testPool)
+
+	family := uuid.New()
+	in := sampleRefreshToken(user.ID, "explicit-family")
+	in.FamilyID = family
+
+	got, err := store.Create(ctx, in)
+	c.NoError(err)
+	c.Equal(family, got.FamilyID, "rotation passes the parent's family id and the store must keep it")
+}
+
+func TestRefreshTokenStore_RevokeFamily(t *testing.T) {
+	c := require.New(t)
+	resetDB(t, "refresh_tokens", "op_users")
+
+	ctx := context.Background()
+	user := createTestOPUser(t, ctx)
+	store := NewRefreshTokenStore(testPool)
+
+	familyA := uuid.New()
+	familyB := uuid.New()
+
+	for _, h := range []string{"a1", "a2"} {
+		in := sampleRefreshToken(user.ID, h)
+		in.FamilyID = familyA
+		_, err := store.Create(ctx, in)
+		c.NoError(err)
+	}
+	in := sampleRefreshToken(user.ID, "b1")
+	in.FamilyID = familyB
+	_, err := store.Create(ctx, in)
+	c.NoError(err)
+
+	affected, err := store.RevokeFamily(ctx, familyA, time.Now())
+	c.NoError(err)
+	c.Equal(int64(2), affected)
+
+	// Token from the untouched family is still live.
+	got, err := store.GetByHash(ctx, "b1")
+	c.NoError(err)
+	c.Nil(got.RevokedAt)
+
+	// Re-running is a no-op.
+	affected, err = store.RevokeFamily(ctx, familyA, time.Now())
+	c.NoError(err)
+	c.Equal(int64(0), affected)
+}
+
 func TestRefreshTokenStore_RevokeAllForUser(t *testing.T) {
 	c := require.New(t)
 	resetDB(t, "refresh_tokens", "op_users")

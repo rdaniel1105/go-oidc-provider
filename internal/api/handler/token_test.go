@@ -62,18 +62,88 @@ func (f *fakeUsersByID) GetByID(_ context.Context, id uuid.UUID) (*domain.OPUser
 	return u, nil
 }
 
-type fakeRefreshCreator struct {
-	mu       sync.Mutex
-	created  []*domain.RefreshToken
+type fakeRefreshStore struct {
+	mu              sync.Mutex
+	created         []*domain.RefreshToken
+	byHash          map[string]*domain.RefreshToken
+	revokedFamilies []uuid.UUID
 }
 
-func (f *fakeRefreshCreator) Create(_ context.Context, t *domain.RefreshToken) (*domain.RefreshToken, error) {
+func newFakeRefreshStore() *fakeRefreshStore {
+	return &fakeRefreshStore{byHash: map[string]*domain.RefreshToken{}}
+}
+
+func (f *fakeRefreshStore) Create(_ context.Context, t *domain.RefreshToken) (*domain.RefreshToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	t.ID = uuid.New()
+
+	if t.ID == uuid.Nil {
+		t.ID = uuid.New()
+	}
+
+	if t.FamilyID == uuid.Nil {
+		t.FamilyID = uuid.New()
+	}
+
 	t.IssuedAt = time.Now().UTC()
-	f.created = append(f.created, t)
-	return t, nil
+	stored := *t
+
+	f.created = append(f.created, &stored)
+	f.byHash[t.TokenHash] = &stored
+
+	return &stored, nil
+}
+
+func (f *fakeRefreshStore) GetByHash(_ context.Context, hash string) (*domain.RefreshToken, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	got, ok := f.byHash[hash]
+	if !ok {
+		return nil, domain.ErrRefreshTokenNotFound
+	}
+
+	cp := *got
+
+	return &cp, nil
+}
+
+func (f *fakeRefreshStore) Revoke(_ context.Context, id uuid.UUID, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, tok := range f.byHash {
+		if tok.ID == id {
+			if tok.RevokedAt == nil {
+				stamp := at
+				tok.RevokedAt = &stamp
+			}
+			return nil
+		}
+	}
+
+	return domain.ErrRefreshTokenNotFound
+}
+
+func (f *fakeRefreshStore) RevokeFamily(_ context.Context, familyID uuid.UUID, at time.Time) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var n int64
+
+	for _, tok := range f.byHash {
+		if tok.FamilyID == familyID && tok.RevokedAt == nil {
+			stamp := at
+			tok.RevokedAt = &stamp
+			n++
+		}
+	}
+
+	if n > 0 {
+		f.revokedFamilies = append(f.revokedFamilies, familyID)
+	}
+
+	return n, nil
 }
 
 type fakeKeySource struct {
@@ -91,7 +161,7 @@ type tokenHarness struct {
 	clients   *fakeClients
 	authCodes *fakeAuthCodeConsumer
 	users     *fakeUsersByID
-	refresh   *fakeRefreshCreator
+	refresh   *fakeRefreshStore
 	keys      *fakeKeySource
 	handler   *TokenHandler
 }
@@ -108,7 +178,7 @@ func newTokenHarness(t *testing.T) *tokenHarness {
 	clients := &fakeClients{byClientID: map[string]*domain.Client{}}
 	authCodes := newFakeAuthCodeConsumer()
 	users := &fakeUsersByID{byID: map[uuid.UUID]*domain.OPUser{}}
-	refresh := &fakeRefreshCreator{}
+	refresh := newFakeRefreshStore()
 	keys := &fakeKeySource{kid: kid, priv: priv}
 
 	h := NewTokenHandler(TokenHandlerDeps{
@@ -405,4 +475,230 @@ func TestToken_AuthCode_UserDeleted(t *testing.T) {
 	rr := postForm(t, h.handler, form, basic("demo-rp", "super-secret"))
 	c.Equal(http.StatusBadRequest, rr.Code)
 	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+}
+
+// --- Refresh grant ---
+
+// completeAuthCodeExchange runs the auth_code grant against the harness
+// and returns the parsed token response. Subsequent refresh-grant tests
+// chain off the refresh_token field of this response.
+func completeAuthCodeExchange(t *testing.T, h *tokenHarness) tokenResponse {
+	t.Helper()
+	code, verifier, _ := seedHappyState(t, h)
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://op.local:8082/callback")
+	form.Set("code_verifier", verifier)
+
+	rr := postForm(t, h.handler, form, basic("demo-rp", "super-secret"))
+	require.Equal(t, http.StatusOK, rr.Code, "body=%s", rr.Body.String())
+
+	var resp tokenResponse
+	require.NoError(t, json.NewDecoder(rr.Body).Decode(&resp))
+	return resp
+}
+
+func refreshForm(refreshToken string) url.Values {
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	return form
+}
+
+func TestToken_Refresh_HappyPath_RotatesAndPreservesFamily(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	// Snapshot the original row's family + auth_time before rotation
+	// consumes it.
+	originalRow, err := h.refresh.GetByHash(t.Context(), oidc.HashRefreshToken(first.RefreshToken))
+	c.NoError(err)
+	originalFamily := originalRow.FamilyID
+	originalAuth := originalRow.AuthTime
+
+	rr := postForm(t, h.handler, refreshForm(first.RefreshToken), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusOK, rr.Code, "body=%s", rr.Body.String())
+
+	var second tokenResponse
+	c.NoError(json.NewDecoder(rr.Body).Decode(&second))
+	c.NotEqual(first.RefreshToken, second.RefreshToken, "rotation must mint a fresh refresh token")
+	c.NotEqual(first.AccessToken, second.AccessToken)
+	c.Equal("openid profile email", second.Scope)
+
+	// New row carries the same family + auth_time as the parent.
+	newRow, err := h.refresh.GetByHash(t.Context(), oidc.HashRefreshToken(second.RefreshToken))
+	c.NoError(err)
+	c.Equal(originalFamily, newRow.FamilyID, "family must persist across rotation")
+	c.WithinDuration(originalAuth, newRow.AuthTime, time.Second)
+	c.Nil(newRow.RevokedAt)
+
+	// Old row is now revoked.
+	oldRow, err := h.refresh.GetByHash(t.Context(), oidc.HashRefreshToken(first.RefreshToken))
+	c.NoError(err)
+	c.NotNil(oldRow.RevokedAt, "the presented token must be revoked after rotation")
+
+	// ID token carries auth_time from the original chain, not the
+	// rotation moment.
+	parsed, err := jwt.ParseSigned(second.IDToken, []jose.SignatureAlgorithm{jose.ES256})
+	c.NoError(err)
+	var claims oidc.IDTokenClaims
+	c.NoError(parsed.Claims(&h.keys.priv.PublicKey, &claims))
+	c.Equal(originalAuth.Unix(), claims.AuthTime, "refreshed ID token must keep the original auth_time")
+	c.Empty(claims.Nonce, "refreshed ID tokens omit nonce")
+}
+
+func TestToken_Refresh_ReplayRevokesFamily(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	originalRow, err := h.refresh.GetByHash(t.Context(), oidc.HashRefreshToken(first.RefreshToken))
+	c.NoError(err)
+	family := originalRow.FamilyID
+
+	// First rotation succeeds — first refresh is now revoked.
+	rr := postForm(t, h.handler, refreshForm(first.RefreshToken), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusOK, rr.Code)
+
+	var second tokenResponse
+	c.NoError(json.NewDecoder(rr.Body).Decode(&second))
+
+	// Replay the first refresh — must be rejected AND the new (live)
+	// descendant must be taken down by the family revoke.
+	rr = postForm(t, h.handler, refreshForm(first.RefreshToken), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+
+	c.Contains(h.refresh.revokedFamilies, family, "replay must trigger a RevokeFamily call")
+
+	// The freshly rotated token is now also revoked.
+	rotatedRow, err := h.refresh.GetByHash(t.Context(), oidc.HashRefreshToken(second.RefreshToken))
+	c.NoError(err)
+	c.NotNil(rotatedRow.RevokedAt, "descendants of the family must be revoked too")
+
+	// And a follow-up exchange of that rotated token fails.
+	rr = postForm(t, h.handler, refreshForm(second.RefreshToken), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+}
+
+func TestToken_Refresh_UnknownToken(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	_, _, _ = seedHappyState(t, h)
+
+	rr := postForm(t, h.handler, refreshForm("never-issued"), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+}
+
+func TestToken_Refresh_MissingToken(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	_, _, _ = seedHappyState(t, h)
+
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+
+	rr := postForm(t, h.handler, form, basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_request", decodeErrorCode(t, rr))
+}
+
+func TestToken_Refresh_ClientMismatchRevokesFamily(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	originalRow, err := h.refresh.GetByHash(t.Context(), oidc.HashRefreshToken(first.RefreshToken))
+	c.NoError(err)
+	family := originalRow.FamilyID
+
+	// Register a second client and present the first client's token.
+	h.clients.byClientID["other-rp"] = &domain.Client{
+		ClientID:                "other-rp",
+		ClientSecretHash:        bcryptHash(t, "other-secret"),
+		TokenEndpointAuthMethod: domain.AuthMethodClientSecretBasic,
+	}
+
+	rr := postForm(t, h.handler, refreshForm(first.RefreshToken), basic("other-rp", "other-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+	c.Contains(h.refresh.revokedFamilies, family,
+		"a client mismatch is treated as a theft signal — revoke the family")
+}
+
+func TestToken_Refresh_ScopeNarrowing_Works(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	form := refreshForm(first.RefreshToken)
+	form.Set("scope", "openid")
+
+	rr := postForm(t, h.handler, form, basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusOK, rr.Code, "body=%s", rr.Body.String())
+
+	var resp tokenResponse
+	c.NoError(json.NewDecoder(rr.Body).Decode(&resp))
+	c.Equal("openid", resp.Scope, "narrowed scope must reflect in the response")
+}
+
+func TestToken_Refresh_ScopeWideningRejected(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	form := refreshForm(first.RefreshToken)
+	form.Set("scope", "openid payment")
+
+	rr := postForm(t, h.handler, form, basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_scope", decodeErrorCode(t, rr))
+}
+
+func TestToken_Refresh_ExpiredToken(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	// Forcibly age the row.
+	hash := oidc.HashRefreshToken(first.RefreshToken)
+	h.refresh.byHash[hash].ExpiresAt = time.Now().Add(-time.Minute)
+
+	rr := postForm(t, h.handler, refreshForm(first.RefreshToken), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+}
+
+func TestToken_Refresh_UserDeleted(t *testing.T) {
+	c := require.New(t)
+	h := newTokenHarness(t)
+	first := completeAuthCodeExchange(t, h)
+
+	hash := oidc.HashRefreshToken(first.RefreshToken)
+	uid := h.refresh.byHash[hash].OPUserID
+	delete(h.users.byID, uid)
+
+	rr := postForm(t, h.handler, refreshForm(first.RefreshToken), basic("demo-rp", "super-secret"))
+	c.Equal(http.StatusBadRequest, rr.Code)
+	c.Equal("invalid_grant", decodeErrorCode(t, rr))
+}
+
+func TestNarrowRefreshScope(t *testing.T) {
+	c := require.New(t)
+
+	got, err := narrowRefreshScope([]string{"openid", "profile"}, "")
+	c.NoError(err)
+	c.Equal([]string{"openid", "profile"}, got)
+
+	got, err = narrowRefreshScope([]string{"openid", "profile"}, "openid")
+	c.NoError(err)
+	c.Equal([]string{"openid"}, got)
+
+	_, err = narrowRefreshScope([]string{"openid"}, "openid payment")
+	c.Error(err)
 }

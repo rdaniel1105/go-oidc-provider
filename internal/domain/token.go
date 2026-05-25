@@ -22,10 +22,21 @@ type RefreshToken struct {
 	ClientID string
 	// OPUserID is the op_user whose authentication backs the token.
 	OPUserID uuid.UUID
+	// FamilyID groups every refresh token descended from the same
+	// initial authentication. Rotation copies this value from parent to
+	// child; replay of a revoked token triggers a family-wide revocation
+	// so the attacker's chain is broken without affecting other
+	// concurrent sessions for the same user.
+	FamilyID uuid.UUID
 	// Scope is the set of scopes the token can be exchanged for. The
 	// access token minted from a refresh exchange is bounded by this
 	// list (the RP may narrow it; widening is rejected).
 	Scope []string
+	// AuthTime is the moment the user proved themselves with a passkey
+	// at the start of this token's family. Carried through every
+	// rotation so refreshed ID tokens still report the original
+	// authentication moment.
+	AuthTime time.Time
 	// IssuedAt is the row creation timestamp.
 	IssuedAt time.Time
 	// ExpiresAt is the wall-clock expiry. Tokens past this point are
