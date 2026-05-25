@@ -30,13 +30,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	discovery := handler.NewDiscoveryHandler(keys, logger)
+	discoveryDoc := oidc.NewDiscoveryDocument(cfg.Issuer)
+	discovery := handler.NewDiscoveryHandler(keys, discoveryDoc, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("GET /.well-known/openid-configuration", discovery.OpenIDConfiguration)
 	mux.HandleFunc("GET /.well-known/jwks.json", discovery.JWKS)
 
 	srv := &http.Server{
