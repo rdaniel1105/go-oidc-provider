@@ -65,6 +65,7 @@ func main() {
 
 	clientStore := pgstore.NewClientStore(pgPool)
 	opUserStore := pgstore.NewOPUserStore(pgPool)
+	refreshTokenStore := pgstore.NewRefreshTokenStore(pgPool)
 	signupStore := redisstore.NewSignupStateStore(redisClient, cfg.ApprovalTokenTTL)
 	authSessionStore := redisstore.NewAuthSessionStore(redisClient, cfg.ApprovalTokenTTL)
 	authCodeStore := redisstore.NewAuthCodeStore(redisClient, cfg.AuthCodeTTL)
@@ -76,12 +77,24 @@ func main() {
 	authorizeHandler := handler.NewAuthorizeHandler(
 		clientStore, opUserStore, authSessionStore, authCodeStore, passkeyClient, logger,
 	)
+	tokenHandler := handler.NewTokenHandler(handler.TokenHandlerDeps{
+		Clients:    clientStore,
+		AuthCodes:  authCodeStore,
+		Users:      opUserStore,
+		Refresh:    refreshTokenStore,
+		Keys:       keys,
+		Issuer:     cfg.Issuer,
+		AccessTTL:  cfg.AccessTokenTTL,
+		RefreshTTL: cfg.RefreshTokenTTL,
+		Logger:     logger,
+	})
 
 	router := api.New(api.Deps{
 		Logger:    logger,
 		Discovery: discoveryHandler,
 		User:      userHandler,
 		Authorize: authorizeHandler,
+		Token:     tokenHandler,
 	})
 
 	srv := &http.Server{

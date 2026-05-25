@@ -27,6 +27,8 @@ type Deps struct {
 	User *handler.UserHandler
 	// Authorize serves the auth-code flow endpoints.
 	Authorize *handler.AuthorizeHandler
+	// Token serves the OAuth/OIDC token endpoint.
+	Token *handler.TokenHandler
 }
 
 // New builds the chi router. /health and /health/ready live at the root
@@ -57,6 +59,7 @@ func New(deps Deps) http.Handler {
 		r.Get("/authorize", deps.Authorize.Authorize)
 		r.Post("/authorize/login/begin", deps.Authorize.LoginBegin)
 		r.Post("/authorize/login/complete", deps.Authorize.LoginComplete)
+		r.Post("/token", deps.Token.Token)
 	})
 
 	return r
